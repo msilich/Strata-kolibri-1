@@ -65,6 +65,13 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# Aleph-Alpha/Kolibri-1 tokenizer.json, revision 5bb7075ba22db733e3834b1c71d2245537cc14ed.
+# Unlike Qwen35, combining marks belong to the punctuation alternative.
+KOLIBRI1_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
 
 # The `deepseek-v3` pre-tokenizer (DeepSeek-V3 / V4.1; llama.cpp LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM, the same regex list as
 # JoyAI and Hunyuan-dense).  UNLIKE the single-pattern families it is a SEQUENCE: each pattern splits the pieces the
@@ -99,9 +106,10 @@ def _sequence_findall(patterns, text: str) -> list[str]:
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
-                 pre: str = "qwen35", special_ids: dict[str, int] | None = None):
+                 pre: str = "qwen35", special_ids: dict[str, int] | None = None, arch: str | None = None):
         self.tokens = tokens
         self.pre = pre
+        self.arch = arch
         self.token_types = token_types
         self.special_ids = special_ids or {}
         self.ids = {t: i for i, t in enumerate(tokens)}
@@ -119,7 +127,10 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        if str(pre).startswith("deepseek"):
+        if arch == "kolibri1":
+            self._re = regex.compile(KOLIBRI1_PATTERN)
+            self._split = self._re.findall
+        elif str(pre).startswith("deepseek"):
             seq = [regex.compile(x) for x in DEEPSEEK3_PATTERNS]
             self._split = lambda text: _sequence_findall(seq, text)
         else:
@@ -179,7 +190,7 @@ class Tokenizer:
                    if k.startswith("tokenizer.ggml.") and k.endswith("_token_id")}
         return cls(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
                    list(md.get("tokenizer.ggml.token_type") or []) or None,
-                   md.get("tokenizer.ggml.pre", "qwen35"), special)
+                   md.get("tokenizer.ggml.pre", "qwen35"), special, md.get("general.architecture"))
 
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:
@@ -481,6 +492,9 @@ def extract(gguf_path, out_dir) -> dict:
         "pre_pattern": QWEN35_PATTERN,
         "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
     }
+    if tk.arch == "kolibri1":
+        cfg.update(arch=tk.arch, pre_pattern=KOLIBRI1_PATTERN,
+                   pre_pattern_source="Aleph-Alpha/Kolibri-1 tokenizer.json@5bb7075ba22db733e3834b1c71d2245537cc14ed")
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
                                               sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8")

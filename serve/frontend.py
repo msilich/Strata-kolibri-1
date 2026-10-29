@@ -40,7 +40,7 @@ class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
 class ChatTemplate:
     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, family: str | None = None):
         def raise_exception(message):
             raise TemplateRequestError(message)
 
@@ -52,6 +52,7 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
+        self.family = family
         self.caps = self._detect_caps()
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
@@ -91,6 +92,12 @@ class ChatTemplate:
             replies = [f"strata_caps_result_{i}" for i in range(count)]
             messages += [{"role": "tool", "content": reply} for reply in replies] + [user]
             prompt = render(messages, tools)
+            if self.family == "kolibri1":
+                schemas = {tool["name"]: tool for tool in tools}
+                parsed = [call for body in re.findall(r"<tool_call>(.*?)</tool_call>", prompt, re.S)
+                          if (call := json_tool_call(body, schemas)) is not None]
+                return [{"name": call.name, "arguments": call.arguments} for call in parsed] == calls \
+                    and all(reply in prompt for reply in replies)
             # Instructions include example XML and literal tag names, which are not model output. Parse only
             # complete calls to our probe functions, using the same body parser as OutputParser.
             bodies = re.findall(r"<tool_call>\s*(<function=strata_caps_call_\d+>.*?</function>)\s*</tool_call>",
@@ -104,8 +111,9 @@ class ChatTemplate:
 
         history = [user, {"role": "assistant", "content": "strata_caps_answer",
                           "reasoning_content": "strata_caps_reasoning"}, user]
+        call_marker = '"arguments"' if self.family == "kolibri1" else "<function="
         return {"supports_tools": all(s in tool_prompt for s in
-                                      ("strata_caps_call_0", "strata_caps_description", "<tool_call>", "<function=")),
+                                      ("strata_caps_call_0", "strata_caps_description", "<tool_call>", call_marker)),
                 "supports_tool_calls": calls_supported(1),
                 "supports_system_role": "strata_caps_system" in render(
                     [{"role": "system", "content": "strata_caps_system"}, user]),
@@ -141,14 +149,18 @@ EFFORT_DEEPSEEK = {"none": None, "off": None, "minimal": None, "disabled": None,
                    "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
 _EFFORT_QWEN = dict(EFFORT)
 _NUMERIC_EFFORT = False
+_KOLIBRI_EFFORT = False
 
 
 def use_family(family: str | None) -> None:
     """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER)."""
-    global _NUMERIC_EFFORT
+    global _NUMERIC_EFFORT, _KOLIBRI_EFFORT
     EFFORT.clear()
     EFFORT.update(EFFORT_DEEPSEEK if family == "deepseek41" else _EFFORT_QWEN)
     _NUMERIC_EFFORT = family == "deepseek41"
+    _KOLIBRI_EFFORT = family == "kolibri1"
+    if _KOLIBRI_EFFORT:
+        EFFORT.update(minimal="low", high="high", xhigh="high", max="high", maximum="high")
 
 
 def effort_kwargs(value) -> dict:
@@ -610,11 +622,20 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     # `false` is a level (thinking off, effort_kwargs): an `or` between the two fields dropped it
     kwargs.update(effort_kwargs(given if given is not None and given != "" else reasoning.get("effort")))
     # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
-    for k, v in (req.get("chat_template_kwargs") or {}).items():
-        if k == "enable_thinking" and not v:
+    ctk = req.get("chat_template_kwargs") or {}
+    if _KOLIBRI_EFFORT:
+        # Kolibri's template gives an explicit effort precedence over enable_thinking.
+        effort = ctk.get("reasoning_effort")
+        if effort is not None and effort != "":
+            kwargs = effort_kwargs(effort)
+        elif not kwargs and ctk.get("enable_thinking") is False:
             kwargs = {"enable_thinking": False}
-        elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
-            kwargs.update(effort_kwargs(v))
+    else:
+        for k, v in ctk.items():
+            if k == "enable_thinking" and not v:
+                kwargs = {"enable_thinking": False}
+            elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
+                kwargs.update(effort_kwargs(v))
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
@@ -702,7 +723,9 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     bt = thinking.get("budget_tokens") if isinstance(thinking, dict) and thinking.get("type") != "disabled" else None
     if isinstance(bt, int) and not isinstance(bt, bool) and bt > 0 and req.get("reasoning_budget_tokens") is None:
         req["reasoning_budget_tokens"] = bt
-    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+    if _KOLIBRI_EFFORT and effort:
+        kwargs.update(effort_kwargs(effort))
+    elif isinstance(thinking, dict) and thinking.get("type") == "disabled":
         kwargs["enable_thinking"] = False
     elif effort:
         kwargs.update(effort_kwargs(effort))
@@ -843,6 +866,16 @@ def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
     return None
 
 
+def kolibri_forced_call(force: str | None) -> str | None:
+    """Translate the existing validated tool choice into Kolibri's JSON envelope."""
+    if not force:
+        return force
+    name = force.split("<function=", 1)[1]
+    head = CALL_START + '\n{"name": '
+    # Leave the space before the arguments to the model: it normally shares a BPE token with {".
+    return head + json.dumps(name[:-2], ensure_ascii=False) + ', "arguments":' if name.endswith(">\n") else head + '"'
+
+
 PARAM_START = "<parameter="
 
 
@@ -903,6 +936,24 @@ def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
     return ToolCall(name=obj["name"], arguments=args) if isinstance(args, dict) else None
 
 
+def json_call_end(text: str, tag: str = CALL_END) -> int:
+    """Find a boundary without treating a tag inside a JSON string as the envelope's end."""
+    end, scanned, quoted, escaped = text.find(tag), 0, False, False
+    while end >= 0:
+        for char in text[scanned:end]:
+            if escaped:
+                escaped = False
+            elif quoted and char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = not quoted
+        if not quoted:
+            return end
+        scanned = end + len(tag)
+        end = text.find(tag, scanned)
+    return -1
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
@@ -943,9 +994,12 @@ class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
+    native_json = False
+
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  recover: bool = False, declared_only: bool = False):
         self.state = "reasoning" if thinking else "content"
+        self._leading_think = self.native_json and thinking
         self.buf = ""
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
@@ -992,7 +1046,7 @@ class OutputParser:
         # recover (opt-in, the config's "tool_call_recovery"): a declared tool's call written next to the template's
         # form is the call - `<parameter=NAME>` as the opener, JSON inside <tool_call>, a bare <function=NAME> at the
         # start of a line outside code, or a second call in the same <tool_call> (which otherwise merges into one).
-        self.recover = recover
+        self.recover = recover and not self.native_json
         self.bare = False            # the call being read opened with <function= alone (no <tool_call> around it)
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._reset_scan()
@@ -1317,22 +1371,33 @@ class OutputParser:
     def feed(self, delta: str) -> list[Event]:
         self.buf += delta
         out: list[Event] = []
+        if self._leading_think:
+            start = self.buf.lstrip()
+            if "<think>".startswith(start) and start != "<think>":
+                return out
+            if start.startswith("<think>"):
+                self.buf = start[len("<think>"):]
+            self._leading_think = False
         while True:
             if self.state == "rcall":
                 # #804: a `<tool_call>` inside the reasoning, with tools declared.  It is held whole (never streamed
                 # as a call) until it ends: a declared name is then a tool call, anything else stays reasoning text.
                 body = self.buf[len(CALL_START):]
-                end, think = call_end(body), body.find(THINK_END)
+                end = json_call_end(body) if self.native_json else call_end(body)
+                think = json_call_end(body, THINK_END) if self.native_json else body.find(THINK_END)
                 if end >= 0 and (think < 0 or think >= end):
                     call = None
-                    try:
-                        name = body[:end].strip()[len("<function="):].split(">", 1)[0].strip()
-                        name = self.aliases.get(name, name)
-                        if name in self.schemas:
-                            call = parse_tool_call(body[:end], self.schemas.get(name))
-                            call.name = name
-                    except ValueError:
-                        pass
+                    if self.native_json:
+                        call = json_tool_call(body[:end], self.schemas)
+                    else:
+                        try:
+                            name = body[:end].strip()[len("<function="):].split(">", 1)[0].strip()
+                            name = self.aliases.get(name, name)
+                            if name in self.schemas:
+                                call = parse_tool_call(body[:end], self.schemas.get(name))
+                                call.name = name
+                        except ValueError:
+                            pass
                     raw = self.buf[:len(CALL_START) + end + len(CALL_END)]
                     if call is not None or self.pending:
                         self.pending.append([raw, call])    # settled by what follows it (see __init__)
@@ -1456,7 +1521,7 @@ class OutputParser:
                 # it is prose that names the format ("I'll use a <tool_call> block") - content, not a malformed call
                 # that ends the request.  Until its follower has arrived it is held, like a partial tag.
                 after = self.buf[i + len(CALL_START):].lstrip()
-                if self.schemas and not after.startswith(FUNC_START):
+                if not self.native_json and self.schemas and not after.startswith(FUNC_START):
                     loose = self._loose_open(after)
                     if loose == "wait":                  # may still become one: held like a partial tag
                         j = i
@@ -1470,7 +1535,8 @@ class OutputParser:
                         at = len(self.buf) - len(after)
                         self.buf = self.buf[:at] + FUNC_START + loose[0] + ">" + after[loose[1]:]
                         continue
-                kind = self._follower(after) if self.recover else None
+                kind = ("json" if after.startswith("{") else "wait" if not after else "text") if self.native_json \
+                    else self._follower(after) if self.recover else None
                 if (after.startswith("<") and kind is None and not FUNC_START.startswith(after)
                         and not after.startswith(FUNC_START)):
                     self.unread += 1
@@ -1486,6 +1552,10 @@ class OutputParser:
                     continue
                 if kind == "wait":
                     after = ""
+                if self.native_json and kind == "text":
+                    out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
+                    self.buf = self.buf[i + len(CALL_START):]
+                    continue
                 is_call = re.match(r"<function=(\s*[^<>\s]+\s*)>", after)
                 if is_call:
                     raw_name = is_call.group(1)
@@ -1532,7 +1602,7 @@ class OutputParser:
             elif self.state == "json":
                 # recover: `{"name": ..., "arguments": {...}}` inside the wrapper is the call once its </tool_call> has
                 # arrived and it names a declared tool; anything else is the text it is
-                i = self.buf.find(CALL_END)
+                i = json_call_end(self.buf) if self.native_json else self.buf.find(CALL_END)
                 if i < 0:
                     return out
                 call = json_tool_call(self.buf[:i].strip(), self.schemas)
@@ -1645,3 +1715,9 @@ class OutputParser:
         self._reset_scan()
         self.state, self.lead = "content", True
         return [Event("tool_call", call=call)]
+
+
+class KolibriOutputParser(OutputParser):
+    """Kolibri's explicit JSON calls and model-generated opening reasoning marker."""
+
+    native_json = True

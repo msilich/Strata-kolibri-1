@@ -9,10 +9,14 @@
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.53 LANGUAGES CXX)
+option(STRATA_BUILD_KOLIBRI "Build the experimental Linux/CUDA Kolibri-1 engine" OFF)
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
 if(STRATA_ENABLE_SYCL)
+  if(STRATA_BUILD_KOLIBRI)
+    message(FATAL_ERROR "STRATA_BUILD_KOLIBRI requires the Linux CUDA backend")
+  endif()
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     message(FATAL_ERROR "STRATA_ENABLE_SYCL is a separate backend; leave STRATA_ENABLE_CUDA and STRATA_ENABLE_HIP off")
   endif()
@@ -2729,4 +2733,26 @@ if(STRATA_BUILD_DSV41 AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND N
     target_link_libraries(ds4_gg_bench PRIVATE strata_kernels_cpu Threads::Threads)
     target_compile_definitions(ds4_gg_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
   endif()
+endif()
+
+# Kolibri uses the existing GGUF/math/cache libraries, without linking new device
+# code into any released engine. No target changes when this option is off.
+if(STRATA_BUILD_KOLIBRI)
+  if(NOT STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_HIP_GFX906 OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "STRATA_BUILD_KOLIBRI currently requires Linux and STRATA_ENABLE_CUDA=ON")
+  endif()
+  add_library(strata_kolibri STATIC src/kolibri/model.cu src/kolibri/kernels.cu)
+  target_include_directories(strata_kolibri PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/kolibri)
+  target_link_libraries(strata_kolibri PUBLIC strata_core strata_kernels strata_prefill strata_artifact CUDA::cudart CUDA::cublas)
+  target_compile_options(strata_kolibri PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
+  add_executable(strata-kolibri src/kolibri/engine.cu)
+  target_link_libraries(strata-kolibri PRIVATE strata_kolibri Threads::Threads)
+  add_executable(kolibri-math-test EXCLUDE_FROM_ALL src/kolibri/kernels_test.cu)
+  target_link_libraries(kolibri-math-test PRIVATE strata_kolibri)
+  add_executable(kolibri-model-test EXCLUDE_FROM_ALL src/kolibri/model_test.cu)
+  target_include_directories(kolibri-model-test PRIVATE ${_strata_gg}/src)
+  target_link_libraries(kolibri-model-test PRIVATE strata_kolibri ggml-base)
+  enable_testing()
+  add_test(NAME kolibri_math COMMAND kolibri-math-test)
+  set_tests_properties(kolibri_math PROPERTIES SKIP_RETURN_CODE 77)
 endif()

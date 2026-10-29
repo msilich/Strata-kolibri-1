@@ -139,6 +139,78 @@ this does not make every model pack compatible. Q2_0's CPU requirements differ f
 See the [CPU and build notes](DETAILS.md) and [older GPU guide](OLDER_GPUS.md) for the relevant hardware.
 Record the actual CPU, compiler, model and validation results when reporting an experimental build.
 
+## Experimental Kolibri-1 (Linux, NVIDIA CUDA)
+
+The optional source engine loads Kolibri-1 Q4_K_M directly from GGUF. It computes
+on one GPU and transfers experts from RAM when they are not in the GPU cache.
+It does not requantize the model. The current limit is 32,768 tokens including
+the answer, with one request at a time. The shared HTTP server keeps its usual
+eight-token reserve within that limit. CPU expert computation, other GPU
+backends, vision and speculative decoding are not implemented in this path.
+This is a source feature, not a model in the released app or `strata launch`.
+
+After configuring the CUDA build described above, enable the optional target:
+
+```sh
+cmake -S . -B build -DSTRATA_BUILD_KOLIBRI=ON
+cmake --build build --target strata-kolibri kolibri-math-test kolibri-model-test -j 4
+./build/kolibri-math-test
+python tools/download_kolibri.py --connections 32
+```
+
+The download script pins the Bartowski GGUF revision, verifies its SHA-256 and
+resumes interrupted downloads. It downloads about 49.76 GB without a bandwidth
+cap. The default destination is `../Strata-data/models/Kolibri-1/`. Export the
+tokenizer from that same file:
+
+```sh
+python tools/strata_tokenizer.py \
+  --gguf ../Strata-data/models/Kolibri-1/Kolibri-1-Q4_K_M.gguf \
+  --out ../Strata-data/packs/kolibri-q4_k_m
+./build/kolibri-model-test ../Strata-data/models/Kolibri-1/Kolibri-1-Q4_K_M.gguf
+```
+
+Create a run config outside the checkout, replacing each absolute path below.
+Use the locally compiled executable: released engines do not include this path.
+
+```json
+{
+  "exe": "/path/to/Strata/build/strata-kolibri",
+  "args": ["--native", "/path/to/Strata-data/models/Kolibri-1/Kolibri-1-Q4_K_M.gguf", "--max-context", "32768"],
+  "arch": "kolibri1",
+  "tokenizer": "/path/to/Strata-data/packs/kolibri-q4_k_m/tokenizer",
+  "model_name": "kolibri-1-q4_k_m",
+  "cwd": "/path/to/Strata",
+  "log": "/path/to/Strata-data/kolibri.log",
+  "parallel": 1,
+  "host": "127.0.0.1",
+  "port": 8080
+}
+```
+
+```sh
+strata serve --config /path/to/Strata-data/kolibri.json --plan
+strata serve --config /path/to/Strata-data/kolibri.json
+```
+
+The existing chat API handles Kolibri's chat template, reasoning and JSON tool
+calls. Its sampling defaults are temperature 1.0, top-p 0.97 and top-k 128;
+explicit request settings take precedence. Use `reasoning_effort: "none"` to
+disable reasoning. An explicit reasoning effort takes precedence over
+`enable_thinking`, as in Kolibri's own template.
+
+GPU cache space is determined after the fixed weights and workspaces are
+allocated. `--expert-vram N` limits it to N GiB; `--expert-slots 0` disables it
+for comparison. Each request reads its complete history again. Long-context
+latency and cache effectiveness depend on the workload; a successful build
+alone is not a model accuracy or performance measurement.
+
+For a numerical comparison, `tools/kolibri/parity.py --help` documents a
+separate llama.cpp reference build pinned to
+`9df0b73c707900b7277a46b5ae52ff7e7e567d13`. It compares layers, logits and
+optional routing traces on identical token IDs. Keep this reference separate
+from Strata's existing llama.cpp dependency.
+
 ## Updating
 
 Stop the running source engine before replacing it. Run `UPDATE.bat` on Windows or `./update.sh` on Linux.
