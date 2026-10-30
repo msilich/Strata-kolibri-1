@@ -161,7 +161,7 @@ public:
     Blas blas{stream.value};
     Model model;
     const int context, chunk;
-    const bool split_attention, split_local_attention, grouped_experts, fast_prefill, fused_decode, tensor_decode, gpu_greedy, gpu_expert_cache, kv_grow, overlap_decode_cache, two_query_prefill, decode_graphs, kv_int8;
+    const bool split_attention, split_local_attention, grouped_experts, fast_prefill, fused_decode, tensor_decode, gpu_greedy, gpu_expert_cache, kv_grow, overlap_decode_cache, two_query_prefill, decode_graphs, kv_int8, packed_prefill;
     int64_t pos = 0;
     std::unique_ptr<Executor> exec;
     std::ofstream layer_dump, router_dump, route_ids_dump;
@@ -169,10 +169,12 @@ public:
     Engine(const std::string& path, int ctx, int ch, double cache_gib, int cache_slots, bool profiling, bool split,
            bool split_local, bool grouped, bool decode_cache_lru, bool prefill, bool fused, bool tensor,
            bool grouped_prefill, bool pin_experts, bool greedy, bool overlap_prefill_uploads, bool device_cache, bool grow_kv,
-           bool overlap_decode = false, bool two_query = false, bool graphs = false, bool int8_kv = false)
+           bool overlap_decode = false, bool two_query = false, bool graphs = false, bool int8_kv = false, bool packed = false)
         : context(ctx), chunk(ch), split_attention(split), split_local_attention(split_local), grouped_experts(grouped),
           fast_prefill(prefill), fused_decode(fused), tensor_decode(tensor), gpu_greedy(greedy), gpu_expert_cache(device_cache), kv_grow(grow_kv),
-          overlap_decode_cache(overlap_decode), two_query_prefill(two_query), decode_graphs(graphs), kv_int8(int8_kv) {
+          overlap_decode_cache(overlap_decode), two_query_prefill(two_query), decode_graphs(graphs), kv_int8(int8_kv), packed_prefill(packed) {
+        if (packed_prefill && !fast_prefill)
+            throw std::runtime_error("--packed-prefill requires --prefill-attention");
         if (kv_int8 && (!fast_prefill || !tensor_decode))
             throw std::runtime_error("--kv int8 requires --prefill-attention --tensor-decode-attention");
         if (two_query_prefill && !fast_prefill)
@@ -185,6 +187,7 @@ public:
         const size_t t = (size_t) chunk;
         x.alloc(t * H); norm.alloc(t * H); mixed.alloc(t * H); moe.alloc(t * H);
         q.alloc(t * Q); k.alloc(t * KV); v.alloc(t * KV); attn.alloc(t * Q);
+        if (packed_prefill && kv_int8) packed_kv.alloc(2 * (size_t)context * KV);
         if (fast_prefill || fused_decode) rope_sin_cos.alloc(t * K::kHeadDim);
         if (split_attention || split_local_attention || tensor_decode)
             attention_scratch.alloc(std::max({split_attention ? K::attention_split_scratch_floats(context) : 0,
@@ -231,7 +234,9 @@ public:
             std::fprintf(stderr, "Kolibri KV growth: %d / %d cells mapped; high-water mark retained until exit\n",
                          kv_cells, context);
         }
-        if (two_query_prefill)
+        if (packed_prefill)
+            std::fprintf(stderr, "Kolibri packed global prefill enabled (four-query/head tiles)\n");
+        else if (two_query_prefill)
             std::fprintf(stderr, "Kolibri two-query global prefill enabled (at least two prompt tokens per chunk)\n");
         if (kv_int8)
             std::fprintf(stderr, "Kolibri global KV: INT8, %zu bytes per layer/token; local KV remains FP16\n",
@@ -353,14 +358,18 @@ public:
                                                      graph ? graph_position.p : nullptr);
                     attention_q8_ready = fuse_decode;
                 } else {
-                    K::prefill_attention_int8(q.p, cache_k, cache_v, attn.p, T, prior + T,
+                    if (packed_prefill && !decode && T >= 4)
+                        K::prefill_attention_packed(q.p, cache_k, cache_v, attn.p, T, prior + T, pos, true, s, packed_kv.p);
+                    else K::prefill_attention_int8(q.p, cache_k, cache_v, attn.p, T, prior + T,
                                               pos, two_query_prefill, s);
                 }
             } else if (graph && !L.local) {
                 K::tensor_decode_attention_q8_graph(q.p, cache_k, cache_v, attn.p, attention_scratch.p,
                                                      graph_position.p, graph_limit, s, exec->attention_decode_q8());
                 attention_q8_ready = true;
-            } else if (two_query_prefill && !decode && !L.local && T >= 2)
+            } else if (packed_prefill && !decode && !L.local && T >= 4)
+                K::prefill_attention_packed(q.p, cache_k, cache_v, attn.p, T, prior + T, pos, false, s);
+            else if (two_query_prefill && !decode && !L.local && T >= 2)
                 K::prefill_attention_two_query(q.p, cache_k, cache_v, attn.p, T, prior + T, pos, s);
             else if (fast_prefill && !decode)
                 K::prefill_attention(q.p, cache_k, cache_v, attn.p, T, prior + T,
@@ -635,6 +644,7 @@ private:
     Buffer<float> grouped_out;
     Buffer<int32_t> route_ids, group_ids, ids;
     Buffer<uint16_t> local_k, local_v;
+    Buffer<uint16_t> packed_kv;
     Buffer<float> attention_scratch, rope_sin_cos;
     Buffer<uint8_t> greedy_scratch;
     Buffer<uint32_t> greedy_status;
@@ -927,7 +937,7 @@ int main(int argc, char** argv) {
              grouped_experts = false, decode_cache_lru = false, prefill_attention = false,
              fused_decode = false, tensor_decode_attention = false, grouped_prefill = false, pin_experts = false,
              gpu_greedy = false, overlap_prefill_uploads = false, gpu_expert_cache = false, kv_grow = false,
-             overlap_decode_cache = false, two_query_prefill = false, decode_graphs = false, prefix_cache = false;
+             overlap_decode_cache = false, two_query_prefill = false, decode_graphs = false, prefix_cache = false, packed_prefill = false;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             auto next = [&]() -> std::string {
@@ -957,6 +967,7 @@ int main(int argc, char** argv) {
                              "  --decode-cache-lru (experimental decode replacement; requires --grouped-experts)\n"
                              "  --prefill-attention (experimental tensor-core prompt attention; CUDA sm_80+)\n"
                              "  --two-query-prefill (share global prompt attention work across token pairs; requires --prefill-attention)\n"
+                             "  --packed-prefill (pack global prompt query/head tiles; requires --prefill-attention)\n"
                              "  --fused-decode (experimental combined decode projections and residual norms)\n"
                              "  --tensor-decode-attention (experimental tensor-core decode attention; CUDA sm_80+)\n";
                 std::cout << "  --decode-graphs (optional token graph; requires device cache and tensor decode attention)\n";
@@ -990,6 +1001,7 @@ int main(int argc, char** argv) {
             else if (arg == "--decode-cache-lru") decode_cache_lru = true;
             else if (arg == "--prefill-attention") prefill_attention = true;
             else if (arg == "--two-query-prefill") two_query_prefill = true;
+            else if (arg == "--packed-prefill") packed_prefill = true;
             else if (arg == "--fused-decode") fused_decode = true;
             else if (arg == "--tensor-decode-attention") tensor_decode_attention = true;
             else if (arg == "--decode-graphs") decode_graphs = true;
@@ -1023,7 +1035,7 @@ int main(int argc, char** argv) {
         Engine engine(model, ctx, chunk, vram, slots, profiling, split_attention, split_local_attention,
                       grouped_experts, decode_cache_lru, prefill_attention, fused_decode, tensor_decode_attention,
                       grouped_prefill, pin_experts, gpu_greedy, overlap_prefill_uploads, gpu_expert_cache, kv_grow,
-                      overlap_decode_cache, two_query_prefill, decode_graphs, kv_type == "int8");
+                      overlap_decode_cache, two_query_prefill, decode_graphs, kv_type == "int8", packed_prefill);
         if (server) return serve(engine, prefix_cache);
         if (!layer_path.empty()) {
             engine.layer_dump.open(layer_path, std::ios::binary);

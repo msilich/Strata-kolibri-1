@@ -27,6 +27,13 @@ void prefill_attention(const float* q, const uint16_t* kcache, const uint16_t* v
 void prefill_attention_two_query(const float* q, const uint16_t* kcache, const uint16_t* vcache,
                                  float* out, int rows, int key_count,
                                  int64_t query_first_pos, void* stream);
+// Global-only packed query/head tiles. Same precision and causal range as the
+// tensor prefill path, with a different summation order. INT8 requires a
+// stream-ordered temporary buffer of 2*key_count*4*128 FP16 elements; FP16 needs
+// no workspace. The stored KV format is unchanged.
+void prefill_attention_packed(const float* q, const void* kcache, const void* vcache,
+                              float* out, int rows, int key_count, int64_t query_first_pos,
+                              bool int8_kv, void* stream, void* workspace = nullptr);
 // Global contiguous INT8 KV, dequantized directly into the shared FP16 tiles.
 void prefill_attention_int8(const float* q, const void* kcache, const void* vcache,
                             float* out, int rows, int key_count, int64_t query_first_pos,

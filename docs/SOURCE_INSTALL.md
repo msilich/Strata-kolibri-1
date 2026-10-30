@@ -342,6 +342,19 @@ shares each global-attention key/value tile between two prompt tokens while
 keeping each token's arithmetic and causal masking. Local attention, generation
 and prompt chunks containing only one token keep their existing paths.
 
+`--packed-prefill` optionally packs four prompt tokens' grouped query heads into
+tensor-core tiles for global attention. It requires `--prefill-attention` and
+works with FP16 or INT8 global KV. For chunks of at least four tokens it takes
+precedence over `--two-query-prefill`. Smaller chunks, local attention and
+single-token generation keep their existing paths. Queries and probabilities
+retain their high and low parts; softmax and output remain FP32. The changed
+reduction order can change generated tokens. It is off by default; add the flag
+to the run config's `args` to compare it on the intended GPU and workload.
+With INT8 KV it uses a reusable FP16 work buffer, converting each global layer
+once per prompt chunk. This needs 2 KiB per configured context token (512 MiB
+at 262,144 tokens) and can leave fewer expert-cache slots. The stored global KV
+cache remains INT8.
+
 `--tensor-decode-attention` enables tensor-core attention during generation,
 independently of `--prefill-attention`. It requires compute capability 8.0 or
 newer and applies to global attention and full 513-key local windows. Where it

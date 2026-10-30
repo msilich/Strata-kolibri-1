@@ -112,7 +112,7 @@ void compare(const char* label, const float* actual, const double* expected, siz
     std::printf("PASS %-38s max_abs=%.6g\n", label, worst);
 }
 
-void run_case(const Case& c, cudaStream_t stream, bool benchmark) {
+void run_case(const Case& c, cudaStream_t stream, bool benchmark, bool packed = false) {
     auto queries = random_values((size_t) c.rows * Q, 101);
     auto key_values = random_values((size_t) c.key_count * KV, 102);
     auto value_values = random_values(key_values.size(), 103);
@@ -139,7 +139,9 @@ void run_case(const Case& c, cudaStream_t stream, bool benchmark) {
     Device<float> q(queries), output(queries.size());
     Device<uint16_t> dk(keys), dv(values);
     const auto run = [&](bool tensor) {
-        if (tensor) k::prefill_attention(q.p, dk.p, dv.p, output.p, c.rows, c.key_count,
+        if (tensor && packed) k::prefill_attention_packed(q.p, dk.p, dv.p, output.p,
+                                                         c.rows, c.key_count, c.query_first, false, stream);
+        else if (tensor) k::prefill_attention(q.p, dk.p, dv.p, output.p, c.rows, c.key_count,
                                          c.key_first, c.query_first, c.local, stream);
         else k::attention(q.p, dk.p, dv.p, output.p, c.rows, c.key_count,
                           c.key_first, c.query_first, c.local, stream);
@@ -182,7 +184,7 @@ void run_case(const Case& c, cudaStream_t stream, bool benchmark) {
 }
 
 void run_two_query_case(const char* name, int rows, int key_count, int64_t query_first,
-                        cudaStream_t stream, uint16_t future_value = 0) {
+                        cudaStream_t stream, uint16_t future_value = 0, bool packed = false) {
     auto queries = random_values((size_t) rows * Q, 201);
     std::vector<uint16_t> keys((size_t) key_count * KV), values(keys.size());
     std::mt19937 random(202);
@@ -203,7 +205,9 @@ void run_two_query_case(const char* name, int rows, int key_count, int64_t query
     check(cudaStreamSynchronize(nullptr));  // Complete pageable setup copies before kernel work.
     k::prefill_attention(q.p, dk.p, dv.p, old_output.p + guard, rows, key_count,
                          0, query_first, false, stream);
-    k::prefill_attention_two_query(q.p, dk.p, dv.p, new_output.p + guard,
+    if (packed) k::prefill_attention_packed(q.p, dk.p, dv.p, new_output.p + guard,
+                                           rows, key_count, query_first, false, stream);
+    else k::prefill_attention_two_query(q.p, dk.p, dv.p, new_output.p + guard,
                                    rows, key_count, query_first, stream);
     check(cudaStreamSynchronize(stream));
     const auto baseline = old_output.download(), actual = new_output.download();
@@ -212,6 +216,12 @@ void run_two_query_case(const char* name, int rows, int key_count, int64_t query
         // The visible nonfinite row has no portable NaN payload contract.
         // All earlier rows must remain finite and bitwise identical.
         const bool exceptional_row = future_value && i >= Q;
+        if (packed) {
+            if (exceptional_row && !std::isfinite(a) && !std::isfinite(b)) continue;
+            require(std::isfinite(a) && std::isfinite(b) && std::abs(a - b) <= 3e-6 + 3e-6 * std::abs(a),
+                    "packed prefill changed numerical output or causality");
+            continue;
+        }
         if (exceptional_row && std::isnan(a) && std::isnan(b)) continue;
         if ((!exceptional_row && (!std::isfinite(a) || !std::isfinite(b))) ||
             std::memcmp(&a, &b, sizeof(float)) != 0) {
@@ -227,7 +237,7 @@ void run_two_query_case(const char* name, int rows, int key_count, int64_t query
                     "two-query prefill changed trailing output guard");
         }
     }
-    std::printf("PASS %-38s exact tensor outputs and guards%s\n", name,
+    std::printf("PASS %-38s %s tensor outputs and guards%s\n", name, packed ? "numerical" : "exact",
                 future_value ? " (visible NaNs compared by class)" : "");
 }
 
@@ -242,6 +252,32 @@ void two_query_checks(cudaStream_t stream, bool bounded) {
         run_two_query_case("two-query maximum chunk", k::kChunk, k::kChunk, 0, stream);
         run_two_query_case("two-query 262144-key cache", 3, 262144, 262141, stream);
     }
+}
+
+void packed_checks(cudaStream_t stream, bool bounded) {
+    for (const Case c : {Case{"packed first token", 1, 1, 0, 0, false},
+                        Case{"packed causal tail", 5, 35, 0, 30, false},
+                        Case{"packed tile boundary", 9, 70, 0, 61, false},
+                        Case{"packed extreme scores", 4, 1027, 0, 1023, false, 1},
+                        Case{"packed Q low bits", 4, 35, 0, 31, false, 2},
+                        Case{"packed P low bits", 4, 35, 0, 31, false, 3},
+                        Case{"packed zero Q", 4, 35, 0, 31, false, 4}})
+        run_case(c, stream, false, true);
+    run_two_query_case("packed future NaN V", 4, 32, 28, stream, 0x7e00, true);
+    run_two_query_case("packed future Inf V", 4, 32, 28, stream, 0x7c00, true);
+    if (!bounded) {
+        run_case({"packed 4096-row chunk", 4096, 4096, 0, 0, false}, stream, false, true);
+        run_two_query_case("packed odd chunk", 4095, 4096, 1, stream, 0, true);
+        run_two_query_case("packed 262144-key cache", 5, 262144, 262139, stream, 0, true);
+    }
+    bool rejected = false;
+    try { k::prefill_attention_packed(nullptr, nullptr, nullptr, nullptr, 4, 35, 32, false, stream); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "packed prefill accepted missing causal history");
+    rejected = false;
+    try { k::prefill_attention_packed(nullptr, nullptr, nullptr, nullptr, 1, 1, 0, true, stream); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "INT8 packed prefill accepted a missing workspace");
 }
 }  // namespace
 
@@ -269,13 +305,19 @@ void int8_prefill_checks(cudaStream_t stream) {
         constexpr int Guard = 32;
         const std::vector<float> initial(queries.size() + 2 * Guard, 12345.25f);
         Device<float> reference_out(initial), output(initial);
+        Device<uint16_t> packed_workspace(2 * (size_t)c.keys * KV);
         k::prefill_attention(q.p, dk.p, dv.p, reference_out.p + Guard, c.rows, c.keys, 0, c.first, false, stream);
         check(cudaStreamSynchronize(stream)); const auto expected = reference_out.download();
-        for (bool pair : {false, true}) {
-            k::prefill_attention_int8(q.p, kc.p, vc.p, output.p + Guard, c.rows, c.keys, c.first, pair, stream);
+        for (int variant : {0, 1, 2}) {
+            if (variant == 2) k::prefill_attention_packed(q.p, kc.p, vc.p, output.p + Guard,
+                                                        c.rows, c.keys, c.first, true, stream, packed_workspace.p);
+            else k::prefill_attention_int8(q.p, kc.p, vc.p, output.p + Guard, c.rows, c.keys, c.first, variant == 1, stream);
             check(cudaStreamSynchronize(stream)); const auto actual = output.download();
             for (size_t i = 0; i < actual.size(); ++i) {
                 if (std::isnan(expected[i])) require(std::isnan(actual[i]), "INT8 prefill hid a non-finite causal value");
+                else if (variant == 2 && i >= Guard && i < Guard + queries.size())
+                    require(std::isfinite(actual[i]) && std::abs(actual[i] - expected[i]) <= 3e-6 + 3e-6 * std::abs(expected[i]),
+                            "INT8 packed prefill differs from independently dequantized cache");
                 else require(!std::memcmp(&actual[i], &expected[i], sizeof(float)),
                              "INT8 prefill differs from independently dequantized FP16 cache or changed guards");
             }
@@ -283,15 +325,16 @@ void int8_prefill_checks(cudaStream_t stream) {
             const auto oracle = reference(shape, queries, keys, values, 0);
             compare("INT8 prefill first query/F64", actual.data() + Guard, oracle.data(), Q, 3e-6);
         }
-        std::printf("PASS INT8 prefill keys=%d rows=%d, single/pair, CPU dequantization, causal masks and guards\n", c.keys, c.rows);
+        std::printf("PASS INT8 prefill keys=%d rows=%d, single/pair/packed, CPU dequantization, causal masks and guards\n", c.keys, c.rows);
     }
 }
 
 int main(int argc, char** argv) {
     const bool benchmark = argc == 2 && std::string(argv[1]) == "--bench";
     const bool two_query_memcheck = argc == 2 && std::string(argv[1]) == "--two-query-memcheck";
-    if (argc > 1 && !benchmark && !two_query_memcheck) {
-        std::fprintf(stderr, "usage: kolibri-prefill-test [--bench|--two-query-memcheck]\n"); return 1;
+    const bool packed_memcheck = argc == 2 && std::string(argv[1]) == "--packed-memcheck";
+    if (argc > 1 && !benchmark && !two_query_memcheck && !packed_memcheck) {
+        std::fprintf(stderr, "usage: kolibri-prefill-test [--bench|--two-query-memcheck|--packed-memcheck]\n"); return 1;
     }
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) { std::puts("SKIP no CUDA device"); return 77; }
@@ -307,6 +350,9 @@ int main(int argc, char** argv) {
                                 Case{"local 1024", 1024, 1536, 31232, 31744, true}}) run_case(c, stream, true);
         } else if (two_query_memcheck) {
             two_query_checks(stream, true);
+        } else if (packed_memcheck) {
+            packed_checks(stream, true);
+            int8_prefill_checks(stream);
         } else {
             int8_prefill_checks(stream);
             for (const Case c : {Case{"global future keys masked", 4, 8, 0, 0, false},
@@ -331,6 +377,7 @@ int main(int argc, char** argv) {
             catch (const std::invalid_argument&) { rejected = true; }
             require(rejected, "prefill accepted an oversized query chunk");
             two_query_checks(stream, false);
+            packed_checks(stream, false);
         }
         check(cudaStreamSynchronize(stream)); check(cudaStreamDestroy(stream));
         std::puts(benchmark ? "DONE Kolibri prefill attention timing" :

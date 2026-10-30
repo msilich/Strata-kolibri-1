@@ -2745,7 +2745,7 @@ if(STRATA_BUILD_KOLIBRI)
               src/kolibri/kv_cache.cu
               src/kolibri/decode_experts.cu src/kolibri/decode_experts_combine.cu
               src/kolibri/decode_cache.cu
-              src/kolibri/prefill_attention.cu src/kolibri/dense_decode.cu
+              src/kolibri/prefill_attention.cu src/kolibri/prefill_packed.cu src/kolibri/dense_decode.cu
               src/kolibri/tensor_decode_attention.cu src/kolibri/decode_norms.cu)
   target_include_directories(strata_kolibri PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/kolibri)
   target_include_directories(strata_kolibri PRIVATE ${_strata_gg}/src ${_strata_gg}/include)
