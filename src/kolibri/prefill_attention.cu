@@ -2,6 +2,7 @@
 // operands. Contiguous causal KV replaces the sparse page-table/selection path.
 #include "prefill_attention.cuh"
 #include "kernels.cuh"
+#include "kv_cache.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -43,6 +44,7 @@ struct Shared {
 };
 static_assert(sizeof(Shared) < 48 * 1024, "prefill attention uses ordinary shared memory");
 
+template<bool Int8 = false>
 __global__ void __launch_bounds__(THREADS) prefill_kernel(
         const float* __restrict__ q, const __half* __restrict__ keys,
         const __half* __restrict__ values, float* __restrict__ output,
@@ -89,8 +91,13 @@ __global__ void __launch_bounds__(THREADS) prefill_kernel(
             uint4 key = make_uint4(0, 0, 0, 0), value = key;
             if (row < count) {
                 const size_t offset = ((size_t) (first + row) * kKvHeads + kvh) * HD;
-                key = __ldg(reinterpret_cast<const uint4*>(keys + offset) + piece);
-                value = __ldg(reinterpret_cast<const uint4*>(values + offset) + piece);
+                if constexpr (Int8) {
+                    key = kv::detail::load8(keys, offset / HD, piece);
+                    value = kv::detail::load8(values, offset / HD, piece);
+                } else {
+                    key = __ldg(reinterpret_cast<const uint4*>(keys + offset) + piece);
+                    value = __ldg(reinterpret_cast<const uint4*>(values + offset) + piece);
+                }
             }
             *reinterpret_cast<uint4*>(&s.k[row][piece * 8]) = key;
             *reinterpret_cast<uint4*>(&s.v[row][piece * 8]) = value;
@@ -214,6 +221,7 @@ struct TwoQueryShared {
 static_assert(sizeof(TwoQueryState) == 11024 && sizeof(TwoQueryShared) == 39456);
 static_assert(sizeof(TwoQueryShared) < 48 * 1024, "two-query attention uses ordinary shared memory");
 
+template<bool Int8 = false>
 __global__ void __launch_bounds__(2 * THREADS) prefill_two_query_kernel(
         const float* __restrict__ q, const __half* __restrict__ keys,
         const __half* __restrict__ values, float* __restrict__ output,
@@ -265,8 +273,13 @@ __global__ void __launch_bounds__(2 * THREADS) prefill_two_query_kernel(
             uint4 key = make_uint4(0, 0, 0, 0), value = key;
             if (row < pair_count) {
                 const size_t offset = ((size_t) (first + row) * kKvHeads + kvh) * HD;
-                key = __ldg(reinterpret_cast<const uint4*>(keys + offset) + piece);
-                value = __ldg(reinterpret_cast<const uint4*>(values + offset) + piece);
+                if constexpr (Int8) {
+                    key = kv::detail::load8(keys, offset / HD, piece);
+                    value = kv::detail::load8(values, offset / HD, piece);
+                } else {
+                    key = __ldg(reinterpret_cast<const uint4*>(keys + offset) + piece);
+                    value = __ldg(reinterpret_cast<const uint4*>(values + offset) + piece);
+                }
             }
             *reinterpret_cast<uint4*>(&shared.k[row][piece * 8]) = key;
             *reinterpret_cast<uint4*>(&shared.v[row][piece * 8]) = value;
@@ -407,7 +420,7 @@ void prefill_attention(const float* q, const uint16_t* keys, const uint16_t* val
     if (rows < 1 || rows > kChunk || key_count < 1 || key_first < 0 || query_first < key_first ||
         query_first + rows > key_first + key_count || key_first > needed_first || (!local && key_first != 0))
         throw std::invalid_argument("Kolibri prefill attention: incomplete causal KV range or invalid shape");
-    prefill_kernel<<<dim3(rows, kKvHeads), THREADS, 0, (cudaStream_t) stream>>>(
+    prefill_kernel<><<<dim3(rows, kKvHeads), THREADS, 0, (cudaStream_t) stream>>>(
         q, (const __half*) keys, (const __half*) values, output, key_first, query_first, local);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess)
@@ -418,8 +431,22 @@ void prefill_attention_two_query(const float* q, const uint16_t* keys, const uin
     if (rows < 1 || rows > kChunk || key_count < 1 || query_first < 0 ||
         query_first + rows > key_count)
         throw std::invalid_argument("Kolibri two-query prefill attention: incomplete causal KV range or invalid shape");
-    prefill_two_query_kernel<<<dim3((rows + 1) / 2, kKvHeads), 2 * THREADS, 0, (cudaStream_t) stream>>>(
+    prefill_two_query_kernel<><<<dim3((rows + 1) / 2, kKvHeads), 2 * THREADS, 0, (cudaStream_t) stream>>>(
         q, (const __half*) keys, (const __half*) values, output, rows, query_first);
+    check(cudaGetLastError());
+}
+
+void prefill_attention_int8(const float* q, const void* keys, const void* values,
+                            float* output, int rows, int key_count, int64_t query_first,
+                            bool two_query, void* stream) {
+    if (rows < 1 || rows > kChunk || query_first < 0 || query_first + rows > key_count)
+        throw std::invalid_argument("Kolibri INT8 prefill: incomplete causal KV range or invalid shape");
+    if (two_query && rows >= 2)
+        prefill_two_query_kernel<true><<<dim3((rows + 1) / 2, kKvHeads), 2 * THREADS, 0, (cudaStream_t) stream>>>(
+            q, (const __half*) keys, (const __half*) values, output, rows, query_first);
+    else
+        prefill_kernel<true><<<dim3(rows, kKvHeads), THREADS, 0, (cudaStream_t) stream>>>(
+            q, (const __half*) keys, (const __half*) values, output, 0, query_first, false);
     check(cudaGetLastError());
 }
 }  // namespace strata::kolibri::kernels

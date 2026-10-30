@@ -27,5 +27,9 @@ void prefill_attention(const float* q, const uint16_t* kcache, const uint16_t* v
 void prefill_attention_two_query(const float* q, const uint16_t* kcache, const uint16_t* vcache,
                                  float* out, int rows, int key_count,
                                  int64_t query_first_pos, void* stream);
+// Global contiguous INT8 KV, dequantized directly into the shared FP16 tiles.
+void prefill_attention_int8(const float* q, const void* kcache, const void* vcache,
+                            float* out, int rows, int key_count, int64_t query_first_pos,
+                            bool two_query, void* stream);
 
 }  // namespace strata::kolibri::kernels

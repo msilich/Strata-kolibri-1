@@ -2742,6 +2742,7 @@ if(STRATA_BUILD_KOLIBRI)
     message(FATAL_ERROR "STRATA_BUILD_KOLIBRI currently requires Linux and STRATA_ENABLE_CUDA=ON")
   endif()
   add_library(strata_kolibri STATIC src/kolibri/model.cu src/kolibri/kernels.cu
+              src/kolibri/kv_cache.cu
               src/kolibri/decode_experts.cu src/kolibri/decode_experts_combine.cu
               src/kolibri/decode_cache.cu
               src/kolibri/prefill_attention.cu src/kolibri/dense_decode.cu

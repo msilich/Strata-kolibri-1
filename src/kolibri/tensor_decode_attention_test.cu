@@ -2,6 +2,7 @@
 #include "prefill_attention.cuh"
 #include "tensor_decode_attention.cuh"
 #include "kernels.cuh"
+#include "kv_cache.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -234,6 +235,55 @@ void graph_replay(cudaStream_t stream) {
 }
 }  // namespace
 
+void int8_decode_checks(cudaStream_t stream) {
+    namespace kv = strata::kolibri::kv;
+    constexpr int Guard = 32, Q8Bytes = Q / 32 * 36;
+    for (int count : {33, 8191, 8192, 32769, 262144}) {
+        const int limit = count == 8191 ? 8191 : std::min(262144, ((count + 1024) / 1024) * 1024);
+        auto key_values = random_values((size_t) limit * KV, 671), value_values = random_values(key_values.size(), 672);
+        Device<float> q(random_values(Q, 670)), kf(key_values), vf(value_values);
+        Device<kv::Int8Head> kc((size_t) limit * k::kKvHeads), vc((size_t) limit * k::kKvHeads);
+        for (int start = 0; start < limit; start += k::kChunk)
+            kv::append_int8(kf.p + (size_t) start * KV, vf.p + (size_t) start * KV, kc.p, vc.p,
+                            std::min(k::kChunk, limit - start), start, stream);
+        check(cudaStreamSynchronize(stream));
+        const auto packed_k = kc.download(), packed_v = vc.download();
+        std::vector<uint16_t> keys(key_values.size()), values(keys.size());
+        for (size_t h = 0; h < packed_k.size(); ++h) for (int d = 0; d < 128; ++d) {
+            keys[h * 128 + d] = half_bits((float) packed_k[h].values[d] * half_value(packed_k[h].scales[d / 64]));
+            values[h * 128 + d] = half_bits((float) packed_v[h].values[d] * half_value(packed_v[h].scales[d / 64]));
+        }
+        Device<uint16_t> dk(keys), dv(values);
+        Device<int32_t> position(std::vector<int32_t>{count - 1});
+        Device<float> reference(std::vector<float>(Q + Guard, -12345.f)), output(std::vector<float>(Q + Guard, -12345.f));
+        const size_t size = k::tensor_decode_attention_scratch_floats(limit);
+        Device<float> scratch(std::vector<float>(size + Guard, -12345.f));
+        Device<uint8_t> expected_q8(std::vector<uint8_t>(Q8Bytes + Guard, 0xa5)), actual_q8(std::vector<uint8_t>(Q8Bytes + Guard, 0xa5));
+        cudaGraph_t graph = nullptr; cudaGraphExec_t executable = nullptr;
+        check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        k::tensor_decode_attention_int8(q.p, kc.p, vc.p, output.p, scratch.p, limit, stream, actual_q8.p, position.p);
+        check(cudaStreamEndCapture(stream, &graph)); check(cudaGraphInstantiate(&executable, graph, 0));
+        for (int n : {count, count == limit ? count - 1 : count + 1}) {
+            const int pos = n - 1;
+            check(cudaMemcpy(position.p, &pos, sizeof(pos), cudaMemcpyHostToDevice));
+            k::tensor_decode_attention_q8(q.p, dk.p, dv.p, reference.p, scratch.p, n, false, stream, expected_q8.p);
+            k::tensor_decode_attention_int8(q.p, kc.p, vc.p, output.p, scratch.p, n, stream, actual_q8.p);
+            check(cudaStreamSynchronize(stream));
+            auto expected = reference.download(), actual = output.download();
+            require(!std::memcmp(expected.data(), actual.data(), actual.size() * sizeof(float)) &&
+                    expected_q8.download() == actual_q8.download(), "INT8 eager decode differs from CPU-dequantized FP16 reference");
+            check(cudaGraphLaunch(executable, stream)); check(cudaStreamSynchronize(stream));
+            actual = output.download();
+            require(!std::memcmp(expected.data(), actual.data(), actual.size() * sizeof(float)) &&
+                    expected_q8.download() == actual_q8.download(), "INT8 graph decode used stale position or different Q8 output");
+            const auto partials = scratch.download();
+            for (size_t i = size; i < partials.size(); ++i) require(partials[i] == -12345.f, "INT8 decode exceeded scratch");
+        }
+        check(cudaGraphExecDestroy(executable)); check(cudaGraphDestroy(graph));
+        std::printf("PASS INT8 tensor decode and graph replay, keys=%d, dequantized reference and guards\n", count);
+    }
+}
+
 int main(int argc, char** argv) {
     const bool benchmark = argc == 2 && std::string(argv[1]) == "--bench";
     if (argc > 1 && !benchmark) { std::fprintf(stderr, "usage: kolibri-tensor-attention-test [--bench]\n"); return 1; }
@@ -249,6 +299,7 @@ int main(int argc, char** argv) {
                                 Case{"global 32K", 1, 32768, 0, 32767, false},
                                 Case{"local full window", 1, 513, 0, 512, true}}) run_case(c, stream, true);
         } else {
+            int8_decode_checks(stream);
             graph_replay(stream);
             for (int keys : {1, 31, 32, 33, 2048, 8191, 8192, 8193, 32768, 32769, 262144})
                 run_case(Case{"global causal prefix", 1, keys, 0, keys - 1, false}, stream, false);

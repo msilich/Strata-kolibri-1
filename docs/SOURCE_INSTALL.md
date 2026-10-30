@@ -365,6 +365,19 @@ replace expert-cache addresses. Capture and rebuilding add work, so measure the
 flag on the intended GPU and workload before keeping it enabled. Validation so
 far is on an RTX 5090; other model paths and their defaults are unchanged.
 
+`--kv int8` optionally compresses the ten global-attention KV caches. Add
+`"--kv", "int8"` to the run config's `args`. The default is `--kv fp16`;
+the Q4_K_M weights and the forty local-attention caches keep their existing
+format. INT8 requires `--prefill-attention --tensor-decode-attention` and works
+with `--decode-graphs` and `--kv-grow`.
+
+The global cache uses 1,152 bytes per layer and token instead of 2,048, including
+scales and alignment. At 262,144 tokens this reduces global KV storage from
+5 GiB to 2.8125 GiB. With `--kv-grow`, the smaller allocation can also retain
+more expert-cache slots. INT8 changes rounding and can change generated tokens.
+Measure both speed and answer quality on the intended workload before enabling
+it; a smaller cache does not guarantee faster prompt processing.
+
 The custom workload runner in `tools/kolibri/benchmark.py` compares German and
 English synthetic project dossiers and pinned source-code excerpts. It prepares
 four input sizes per workload, reserving 256 output tokens within 2k, 8k, 16k

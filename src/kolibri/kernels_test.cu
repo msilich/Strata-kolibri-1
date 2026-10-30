@@ -2,6 +2,7 @@
 // Attention uses a CPU F64 reference over the exact F16 cache sent to CUDA.
 #include "kernels.cuh"
 #include "decode_cache.cuh"
+#include "kv_cache.cuh"
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_fp16.h>
@@ -351,6 +352,103 @@ void qk_append_decode(cudaStream_t stream) {
     }
 }
 
+
+__global__ void dequant_int8_test(const strata::kolibri::kv::Int8Head* cache, uint16_t* output) {
+    const int piece = threadIdx.x;
+    *reinterpret_cast<uint4*>(output + blockIdx.x * 128 + piece * 8) =
+        strata::kolibri::kv::detail::load8(cache, blockIdx.x, piece);
+}
+
+void int8_cache(cudaStream_t stream) {
+    namespace kv = strata::kolibri::kv;
+    constexpr int rows = 3, offset = 2;
+    auto keys = random_values(rows * KV, 471, 4.f), values = random_values(rows * KV, 472, 5.f);
+    std::fill_n(keys.begin(), 64, 0.f);
+    std::fill_n(values.begin(), 64, 1e-8f);
+    keys[64] = 127.f; keys[65] = 1.5f; keys[66] = 2.5f; keys[67] = -1.5f;
+    std::vector<kv::Int8Head> initial((offset + rows + 1) * k::kKvHeads);
+    std::memset(initial.data(), 0x5a, initial.size() * sizeof(kv::Int8Head));
+    Device<float> dk(keys), dv(values);
+    Device<kv::Int8Head> kc(initial), vc(initial);
+    kv::append_int8(dk.p, dv.p, kc.p, vc.p, rows, offset, stream);
+    check(cudaStreamSynchronize(stream));
+    auto reference = [&](const std::vector<float>& input) {
+        auto expected = initial;
+        for (int head = 0; head < rows * k::kKvHeads; ++head) {
+            auto& out = expected[offset * k::kKvHeads + head];
+            for (int group = 0; group < 2; ++group) {
+                float amax = 0.f;
+                for (int i = 0; i < 64; ++i) amax = std::max(amax, std::abs(input[head * 128 + group * 64 + i]));
+                out.scales[group] = half_bits(amax / 127.f);
+                const float scale = half_value(out.scales[group]);
+                for (int i = 0; i < 64; ++i) {
+                    const int j = group * 64 + i;
+                    out.values[j] = scale > 0.f ? (int8_t) std::clamp((int) std::nearbyintf(input[head * 128 + j] / scale), -127, 127) : 0;
+                }
+            }
+        }
+        return expected;
+    };
+    auto expected_k = reference(keys), expected_v = reference(values);
+    auto got_k = kc.download(), got_v = vc.download();
+    require(!std::memcmp(got_k.data(), expected_k.data(), got_k.size() * sizeof(kv::Int8Head)) &&
+            !std::memcmp(got_v.data(), expected_v.data(), got_v.size() * sizeof(kv::Int8Head)),
+            "INT8 KV differs from CPU scale/code oracle or overwrites guards");
+
+    // The fused decode must normalize Q/K exactly as before, then store the
+    // same INT8 bytes as the independent append kernel, including graph replay.
+    auto queries = random_values(Q, 473, 3.f), one_key = random_values(KV, 474, 4.f);
+    auto one_value = random_values(KV, 475, 5.f);
+    Device<float> qw(random_values(k::kHeadDim, 476)), kw(random_values(k::kHeadDim, 477));
+    Device<float> rq(queries), rk(one_key), fq(queries), fk(one_key), v(one_value);
+    Device<int32_t> position(std::vector<int32_t>{offset});
+    cudaGraph_t graph = nullptr; cudaGraphExec_t executable = nullptr;
+    check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    k::qk_norm_append_decode_int8(fq.p, fk.p, v.p, qw.p, kw.p, kc.p, vc.p, 0, position.p, 1e-6f, stream);
+    check(cudaStreamEndCapture(stream, &graph)); check(cudaGraphInstantiate(&executable, graph, 0));
+    for (int pos : {offset, offset + 1}) {
+        rq.upload(queries); rk.upload(one_key); fq.upload(queries); fk.upload(one_key);
+        kc.upload(initial); vc.upload(initial); position.upload({pos});
+        k::qk_norm_rope(rq.p, rk.p, qw.p, kw.p, 1, pos, false, 10000.f, 1e-6f, stream);
+        kv::append_int8(rk.p, v.p, kc.p, vc.p, 1, pos, stream);
+        check(cudaStreamSynchronize(stream)); expected_k = kc.download(); expected_v = vc.download();
+        kc.upload(initial); vc.upload(initial);
+        check(cudaGraphLaunch(executable, stream)); check(cudaStreamSynchronize(stream));
+        got_k = kc.download(); got_v = vc.download();
+        require(!std::memcmp(got_k.data(), expected_k.data(), got_k.size() * sizeof(kv::Int8Head)) &&
+                !std::memcmp(got_v.data(), expected_v.data(), got_v.size() * sizeof(kv::Int8Head)),
+                "fused INT8 KV graph changes bytes or uses a stale position");
+        const auto eq = rq.download(), ek = rk.download(), aq = fq.download(), ak = fk.download();
+        require(!std::memcmp(eq.data(), aq.data(), eq.size() * sizeof(float)) &&
+                !std::memcmp(ek.data(), ak.data(), ek.size() * sizeof(float)), "INT8 KV changed Q/K normalization");
+    }
+    check(cudaGraphExecDestroy(executable)); check(cudaGraphDestroy(graph));
+    keys[0] = NAN; dk.upload(keys);
+    kv::append_int8(dk.p, dv.p, kc.p, vc.p, rows, offset, stream); check(cudaStreamSynchronize(stream));
+    require(std::isnan(half_value(kc.download()[offset * k::kKvHeads].scales[0])),
+            "INT8 KV silently discarded a non-finite source");
+    std::vector<kv::Int8Head> records;
+    for (uint16_t scale : {0x0000, 0x0001, 0x03ff, 0x0400, 0x1400, 0x3c00, 0x5400, 0x7bff, 0x7c00, 0x7e00}) {
+        for (int h = 0; h < 2; ++h) {
+            kv::Int8Head record{};
+            record.scales[0] = record.scales[1] = scale;
+            for (int d = 0; d < 128; ++d) record.values[d] = (int8_t) (h * 128 + d - 128);
+            records.push_back(record);
+        }
+    }
+    Device<kv::Int8Head> encoded(records);
+    Device<uint16_t> unpacked(records.size() * 128);
+    dequant_int8_test<<<records.size(), 16, 0, stream>>>(encoded.p, unpacked.p);
+    check(cudaGetLastError()); check(cudaStreamSynchronize(stream));
+    const auto decoded = unpacked.download();
+    for (size_t h = 0; h < records.size(); ++h) for (int d = 0; d < 128; ++d) {
+        const float expected = (float) records[h].values[d] * half_value(records[h].scales[d / 64]);
+        require(std::isnan(expected) ? std::isnan(half_value(decoded[h * 128 + d])) :
+                                      decoded[h * 128 + d] == half_bits(expected),
+                "packed INT8 dequantization changes FP16 rounding or non-finite classification");
+    }
+    std::puts("PASS INT8 KV CPU oracle, rounding, underflow, guards, fused graph positions and non-finite scale");
+}
 
 void append(cudaStream_t stream) {
     constexpr int rows = k::kChunk, offset = 7;
@@ -892,6 +990,7 @@ int main(int argc, char** argv) {
             qk_norm_rope(stream);
             qk_cached(stream);
             qk_append_decode(stream);
+            int8_cache(stream);
             append(stream);
             routing(stream);
             route_cache(stream);

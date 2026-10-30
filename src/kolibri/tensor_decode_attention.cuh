@@ -27,5 +27,10 @@ void tensor_decode_attention_q8(const float* q, const uint16_t* kcache, const ui
 void tensor_decode_attention_q8_graph(const float* q, const uint16_t* kcache, const uint16_t* vcache,
                                       float* out, float* scratch, const int32_t* position,
                                       int max_key_count, void* stream, void* q8);
+// Global INT8 KV. With a device position, key_count is the graph's upper bound
+// within one partition class; otherwise it is the actual number of valid keys.
+void tensor_decode_attention_int8(const float* q, const void* kcache, const void* vcache,
+                                  float* out, float* scratch, int key_count, void* stream,
+                                  void* q8 = nullptr, const int32_t* position = nullptr);
 
 }  // namespace strata::kolibri::kernels

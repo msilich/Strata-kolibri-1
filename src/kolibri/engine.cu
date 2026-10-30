@@ -5,6 +5,7 @@
 #include "decode_norms.cuh"
 #include "prefill_attention.cuh"
 #include "tensor_decode_attention.cuh"
+#include "kv_cache.cuh"
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/vmm.hpp"
 #include "strata/core/logit_bias.hpp"
@@ -160,7 +161,7 @@ public:
     Blas blas{stream.value};
     Model model;
     const int context, chunk;
-    const bool split_attention, split_local_attention, grouped_experts, fast_prefill, fused_decode, tensor_decode, gpu_greedy, gpu_expert_cache, kv_grow, overlap_decode_cache, two_query_prefill, decode_graphs;
+    const bool split_attention, split_local_attention, grouped_experts, fast_prefill, fused_decode, tensor_decode, gpu_greedy, gpu_expert_cache, kv_grow, overlap_decode_cache, two_query_prefill, decode_graphs, kv_int8;
     int64_t pos = 0;
     std::unique_ptr<Executor> exec;
     std::ofstream layer_dump, router_dump, route_ids_dump;
@@ -168,10 +169,12 @@ public:
     Engine(const std::string& path, int ctx, int ch, double cache_gib, int cache_slots, bool profiling, bool split,
            bool split_local, bool grouped, bool decode_cache_lru, bool prefill, bool fused, bool tensor,
            bool grouped_prefill, bool pin_experts, bool greedy, bool overlap_prefill_uploads, bool device_cache, bool grow_kv,
-           bool overlap_decode = false, bool two_query = false, bool graphs = false)
+           bool overlap_decode = false, bool two_query = false, bool graphs = false, bool int8_kv = false)
         : context(ctx), chunk(ch), split_attention(split), split_local_attention(split_local), grouped_experts(grouped),
           fast_prefill(prefill), fused_decode(fused), tensor_decode(tensor), gpu_greedy(greedy), gpu_expert_cache(device_cache), kv_grow(grow_kv),
-          overlap_decode_cache(overlap_decode), two_query_prefill(two_query), decode_graphs(graphs) {
+          overlap_decode_cache(overlap_decode), two_query_prefill(two_query), decode_graphs(graphs), kv_int8(int8_kv) {
+        if (kv_int8 && (!fast_prefill || !tensor_decode))
+            throw std::runtime_error("--kv int8 requires --prefill-attention --tensor-decode-attention");
         if (two_query_prefill && !fast_prefill)
             throw std::runtime_error("--two-query-prefill requires --prefill-attention");
         if ((fast_prefill || tensor_decode) && !K::prefill_attention_supported())
@@ -208,14 +211,15 @@ public:
             const size_t cells = model.layers[l].local ? (size_t) (512 + chunk) : (size_t) context;
             if (kv_grow && !model.layers[l].local) {
                 for (auto* range : {&global_k[l], &global_v[l]}) {
-                    if (!range->reserve(cells * KV * sizeof(uint16_t)) ||
+                    if (!range->reserve(cells * global_cell_bytes()) ||
                         !range->map_range(0, kv_chunks(kv_cells), [] { return strata::core::VmmChunk(0); }))
                         throw std::runtime_error("Kolibri: initial global KV virtual-memory allocation failed");
                     kv_full_bytes += (size_t) range->chunks() * kv_granularity;
                     kv_mapped_bytes += (size_t) range->mapped_count() * kv_granularity;
                 }
             } else {
-                caches[l].k.alloc(cells * KV); caches[l].v.alloc(cells * KV);
+                const size_t words = model.layers[l].local ? KV : global_cell_bytes() / sizeof(uint16_t);
+                caches[l].k.alloc(cells * words); caches[l].v.alloc(cells * words);
             }
         }
         exec = std::make_unique<Executor>(model, stream.value, chunk, cache_gib, cache_slots, grouped_experts,
@@ -229,6 +233,9 @@ public:
         }
         if (two_query_prefill)
             std::fprintf(stderr, "Kolibri two-query global prefill enabled (at least two prompt tokens per chunk)\n");
+        if (kv_int8)
+            std::fprintf(stderr, "Kolibri global KV: INT8, %zu bytes per layer/token; local KV remains FP16\n",
+                         2 * global_cell_bytes());
         std::fprintf(stderr, "Kolibri-1: context %d, chunk %d, expert cache %d slots / %.2f GiB\n",
                      context, chunk, exec->cache_slots(), (double) exec->cache_bytes() / (1ull << 30));
     }
@@ -317,7 +324,10 @@ public:
             auto& cache = caches[(size_t) l];
             auto* cache_k = kv_grow && !L.local ? reinterpret_cast<uint16_t*>(global_k[l].base()) : cache.k.p;
             auto* cache_v = kv_grow && !L.local ? reinterpret_cast<uint16_t*>(global_v[l].base()) : cache.v.p;
-            if (graph && !L.local) {
+            if (kv_int8 && !L.local && fuse_decode) {
+                K::qk_norm_append_decode_int8(q.p, k.p, v.p, L.q_norm, L.k_norm, cache_k, cache_v,
+                                              prior, graph ? graph_position.p : nullptr, model.eps, s);
+            } else if (graph && !L.local) {
                 K::qk_norm_append_decode_graph(q.p, k.p, v.p, L.q_norm, L.k_norm,
                                                cache_k, cache_v, graph_position.p, model.eps, s);
             } else if (fuse_decode) {
@@ -328,11 +338,23 @@ public:
                     K::qk_norm_rope_cached(q.p, k.p, L.q_norm, L.k_norm, T, rope_sin_cos.p, model.eps, s);
                 else
                     K::qk_norm_rope(q.p, k.p, L.q_norm, L.k_norm, T, pos, L.local, model.rope_base, model.eps, s);
-                K::append_kv(k.p, v.p, cache_k, cache_v, T, prior, s);
+                if (kv_int8 && !L.local) strata::kolibri::kv::append_int8(k.p, v.p, cache_k, cache_v, T, prior, s);
+                else K::append_kv(k.p, v.p, cache_k, cache_v, T, prior, s);
             }
             profile_mark(L.local ? ForwardProfile::LocalAttention : ForwardProfile::GlobalAttention);
             bool attention_q8_ready = false;
-            if (graph && !L.local) {
+            if (kv_int8 && !L.local) {
+                if (decode && T == 1) {
+                    K::tensor_decode_attention_int8(q.p, cache_k, cache_v, attn.p, attention_scratch.p,
+                                                     graph ? graph_limit : prior + T, s,
+                                                     fuse_decode ? exec->attention_decode_q8() : nullptr,
+                                                     graph ? graph_position.p : nullptr);
+                    attention_q8_ready = fuse_decode;
+                } else {
+                    K::prefill_attention_int8(q.p, cache_k, cache_v, attn.p, T, prior + T,
+                                              pos, two_query_prefill, s);
+                }
+            } else if (graph && !L.local) {
                 K::tensor_decode_attention_q8_graph(q.p, cache_k, cache_v, attn.p, attention_scratch.p,
                                                      graph_position.p, graph_limit, s, exec->attention_decode_q8());
                 attention_q8_ready = true;
@@ -600,8 +622,11 @@ private:
     std::array<strata::core::VmmRange, 50> global_k, global_v;
     size_t kv_granularity = 0, kv_full_bytes = 0, kv_mapped_bytes = 0;
     int kv_cells = 0;
+    size_t global_cell_bytes() const {
+        return kv_int8 ? strata::kolibri::kv::Int8CellBytes : KV * sizeof(uint16_t);
+    }
     int64_t kv_chunks(int cells) const {
-        return (int64_t) (((size_t) cells * KV * sizeof(uint16_t) + kv_granularity - 1) / kv_granularity);
+        return (int64_t) (((size_t) cells * global_cell_bytes() + kv_granularity - 1) / kv_granularity);
     }
     Buffer<float> x, norm, mixed, moe, q, k, v, attn, gate, up, hidden, router;
     Buffer<float> route_weights, group_weights, gathered, expert_out, logits;
@@ -867,6 +892,7 @@ int serve(Engine& engine) {
 int main(int argc, char** argv) {
     try {
         std::string model, tokens, forced, layer_path, logits_path, router_path, route_ids_path;
+        std::string kv_type = "fp16";
         int ctx = 32768, chunk = 256, n = 64, slots = -1;
         double vram = -1;
         bool server = false, profiling = false, split_attention = false, split_local_attention = false,
@@ -886,6 +912,7 @@ int main(int argc, char** argv) {
                 std::cout << "strata-kolibri --native MODEL [--max-context 1..262144 (default 32768)] [--chunk 1..4096 (default 256)]\n"
                              "  --serve | --tokens ID,ID,... [--n 64] [--force ID,ID,...]\n"
                              "  --expert-vram GiB | --expert-slots N (per layer, 0 disables cache)\n"
+                             "  --kv fp16|int8 (default fp16; int8 changes global KV only)\n"
                              "  --kv-grow (experimental: map global KV as needed, shrink expert cache; retain high-water mark until exit)\n"
                              "  --dump-layers FILE --dump-full-logits FILE (diagnostic binary F32)\n"
                              "  --dump-router FILE (F32 [position,50,384]) --dump-route-ids FILE (I32 [position,50,6])\n"
@@ -909,6 +936,7 @@ int main(int argc, char** argv) {
             } else if (arg == "--native" || arg == "--model") model = next();
             else if (arg == "--max-context") ctx = std::stoi(next());
             else if (arg == "--chunk") chunk = std::stoi(next());
+            else if (arg == "--kv") kv_type = next();
             else if (arg == "--expert-vram") vram = std::stod(next());
             else if (arg == "--expert-slots") slots = std::stoi(next());
             else if (arg == "--tokens") tokens = next();
@@ -938,7 +966,7 @@ int main(int argc, char** argv) {
             else if (arg == "--decode-graphs") decode_graphs = true;
             else throw std::runtime_error("unknown option: " + arg);
         }
-        if (model.empty() || ctx < 1 || ctx > 262144 || chunk < 1 || chunk > K::kChunk || n < 1 ||
+        if (model.empty() || (kv_type != "fp16" && kv_type != "int8") || ctx < 1 || ctx > 262144 || chunk < 1 || chunk > K::kChunk || n < 1 ||
             slots < -1 || slots > 384 || !std::isfinite(vram) || (vram < 0 && vram != -1) || (!server && tokens.empty()))
             throw std::runtime_error("invalid options; use --help");
         if (decode_cache_lru && !grouped_experts)
@@ -964,7 +992,7 @@ int main(int argc, char** argv) {
         Engine engine(model, ctx, chunk, vram, slots, profiling, split_attention, split_local_attention,
                       grouped_experts, decode_cache_lru, prefill_attention, fused_decode, tensor_decode_attention,
                       grouped_prefill, pin_experts, gpu_greedy, overlap_prefill_uploads, gpu_expert_cache, kv_grow,
-                      overlap_decode_cache, two_query_prefill, decode_graphs);
+                      overlap_decode_cache, two_query_prefill, decode_graphs, kv_type == "int8");
         if (server) return serve(engine);
         if (!layer_path.empty()) {
             engine.layer_dump.open(layer_path, std::ios::binary);

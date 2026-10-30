@@ -41,6 +41,9 @@ void qk_norm_rope_append_decode(float* q, float* k, const float* v, const float*
 void qk_norm_append_decode_graph(float* q, float* k, const float* v, const float* qw, const float* kw,
                                 uint16_t* kcache, uint16_t* vcache, const int32_t* position,
                                 float eps, void* stream);
+void qk_norm_append_decode_int8(float* q, float* k, const float* v, const float* qw, const float* kw,
+                               void* kcache, void* vcache, int offset, const int32_t* position,
+                               float eps, void* stream);
 // k/v [rows,4,128] into token-major caches beginning at dst_offset.
 void append_kv(const float* k, const float* v, uint16_t* kcache, uint16_t* vcache,
                int rows, int dst_offset, void* stream);

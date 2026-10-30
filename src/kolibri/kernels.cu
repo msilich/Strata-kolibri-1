@@ -1,5 +1,6 @@
 #include "kernels.cuh"
 #include "decode_route.cuh"
+#include "kv_cache.cuh"
 #define STRATA_Q81_FASTMATH_DIV 1
 #include "strata/kernels/q8_1_finite.hpp"
 #define GGML_COMMON_DECL_CUDA
@@ -133,7 +134,7 @@ __global__ void qk_cached_kernel(float* q, float* k, const float* qw, const floa
 
 // T=1 only. Preserve the original norm/RoPE arithmetic and write the same
 // F32 Q/K values while the four K heads also append their F16 K/V values.
-template <bool Local, bool DevicePosition = false>
+template <bool Local, bool DevicePosition = false, bool Int8 = false>
 __global__ void qk_append_decode_kernel(float* q, float* k, const float* v,
                                         const float* qw, const float* kw, const float* sin_cos,
                                         __half* kc, __half* vc, size_t offset, float eps,
@@ -168,8 +169,14 @@ __global__ void qk_append_decode_kernel(float* q, float* k, const float* v,
     x[i] = result;
     if (!query) {
         const size_t j = (size_t) (h - kQueryHeads) * kHeadDim + i;
-        kc[offset + j] = __float2half_rn(result);
-        vc[offset + j] = __float2half_rn(v[j]);
+        if constexpr (Int8) {
+            const size_t head = offset / kHeadDim + h - kQueryHeads;
+            kv::detail::store_pair(result, v[j], reinterpret_cast<kv::Int8Head*>(kc) + head,
+                                    reinterpret_cast<kv::Int8Head*>(vc) + head);
+        } else {
+            kc[offset + j] = __float2half_rn(result);
+            vc[offset + j] = __float2half_rn(v[j]);
+        }
     }
 }
 
@@ -512,6 +519,19 @@ void qk_norm_append_decode_graph(float* q, float* k, const float* v, const float
     qk_append_decode_kernel<false, true><<<dim3(1, kQueryHeads + kKvHeads), kHeadDim, 0, (cudaStream_t) stream>>>(
         q, k, v, qw, kw, nullptr, (__half*) kc, (__half*) vc, 0, eps, position);
     checked("graph QK norm and KV append");
+}
+
+void qk_norm_append_decode_int8(float* q, float* k, const float* v, const float* qw, const float* kw,
+                               void* kc, void* vc, int offset, const int32_t* position, float eps, void* stream) {
+    const dim3 grid(1, kQueryHeads + kKvHeads);
+    if (position)
+        qk_append_decode_kernel<false, true, true><<<grid, kHeadDim, 0, (cudaStream_t) stream>>>(
+            q, k, v, qw, kw, nullptr, (__half*) kc, (__half*) vc, 0, eps, position);
+    else
+        qk_append_decode_kernel<false, false, true><<<grid, kHeadDim, 0, (cudaStream_t) stream>>>(
+            q, k, v, qw, kw, nullptr, (__half*) kc, (__half*) vc,
+            (size_t) offset * kKvHeads * kHeadDim, eps);
+    checked("INT8 QK norm and KV append");
 }
 
 void append_kv(const float* k, const float* v, uint16_t* kc, uint16_t* vc, int rows, int dst_offset, void* stream) {

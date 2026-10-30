@@ -1,6 +1,7 @@
 // Focused numerical checks and optional resident-input timing for Kolibri prefill.
 #include "prefill_attention.cuh"
 #include "kernels.cuh"
+#include "kv_cache.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -244,6 +245,48 @@ void two_query_checks(cudaStream_t stream, bool bounded) {
 }
 }  // namespace
 
+void int8_prefill_checks(cudaStream_t stream) {
+    namespace kv = strata::kolibri::kv;
+    struct Shape { int rows, keys, first; bool future_nan; };
+    for (auto c : {Shape{1, 1, 0, false}, Shape{3, 34, 31, false}, Shape{4, 8195, 8191, false},
+                    Shape{3, 32768, 32765, false}, Shape{3, 262144, 262141, false}, Shape{2, 32, 30, true}}) {
+        const auto queries = random_values((size_t) c.rows * Q, 561);
+        auto key_values = random_values((size_t) c.keys * KV, 562), value_values = random_values(key_values.size(), 563);
+        if (c.future_nan) std::fill_n(value_values.begin() + (size_t) (c.first + 1) * KV, KV, NAN);
+        Device<float> q(queries), kf(key_values), vf(value_values);
+        Device<kv::Int8Head> kc((size_t) c.keys * k::kKvHeads), vc((size_t) c.keys * k::kKvHeads);
+        for (int start = 0; start < c.keys; start += k::kChunk)
+            kv::append_int8(kf.p + (size_t) start * KV, vf.p + (size_t) start * KV, kc.p, vc.p,
+                            std::min(k::kChunk, c.keys - start), start, stream);
+        check(cudaStreamSynchronize(stream));
+        const auto packed_k = kc.download(), packed_v = vc.download();
+        std::vector<uint16_t> keys(key_values.size()), values(keys.size());
+        for (size_t h = 0; h < packed_k.size(); ++h) for (int d = 0; d < 128; ++d) {
+            keys[h * 128 + d] = half_bits((float) packed_k[h].values[d] * half_value(packed_k[h].scales[d / 64]));
+            values[h * 128 + d] = half_bits((float) packed_v[h].values[d] * half_value(packed_v[h].scales[d / 64]));
+        }
+        Device<uint16_t> dk(keys), dv(values);
+        constexpr int Guard = 32;
+        const std::vector<float> initial(queries.size() + 2 * Guard, 12345.25f);
+        Device<float> reference_out(initial), output(initial);
+        k::prefill_attention(q.p, dk.p, dv.p, reference_out.p + Guard, c.rows, c.keys, 0, c.first, false, stream);
+        check(cudaStreamSynchronize(stream)); const auto expected = reference_out.download();
+        for (bool pair : {false, true}) {
+            k::prefill_attention_int8(q.p, kc.p, vc.p, output.p + Guard, c.rows, c.keys, c.first, pair, stream);
+            check(cudaStreamSynchronize(stream)); const auto actual = output.download();
+            for (size_t i = 0; i < actual.size(); ++i) {
+                if (std::isnan(expected[i])) require(std::isnan(actual[i]), "INT8 prefill hid a non-finite causal value");
+                else require(!std::memcmp(&actual[i], &expected[i], sizeof(float)),
+                             "INT8 prefill differs from independently dequantized FP16 cache or changed guards");
+            }
+            const Case shape{"INT8 dequantized cache", c.rows, c.keys, 0, c.first, false};
+            const auto oracle = reference(shape, queries, keys, values, 0);
+            compare("INT8 prefill first query/F64", actual.data() + Guard, oracle.data(), Q, 3e-6);
+        }
+        std::printf("PASS INT8 prefill keys=%d rows=%d, single/pair, CPU dequantization, causal masks and guards\n", c.keys, c.rows);
+    }
+}
+
 int main(int argc, char** argv) {
     const bool benchmark = argc == 2 && std::string(argv[1]) == "--bench";
     const bool two_query_memcheck = argc == 2 && std::string(argv[1]) == "--two-query-memcheck";
@@ -265,6 +308,7 @@ int main(int argc, char** argv) {
         } else if (two_query_memcheck) {
             two_query_checks(stream, true);
         } else {
+            int8_prefill_checks(stream);
             for (const Case c : {Case{"global future keys masked", 4, 8, 0, 0, false},
                                 Case{"global 32-key boundary", 4, 35, 0, 30, false},
                                 Case{"global full 32K", 4, 32768, 0, 32764, false},

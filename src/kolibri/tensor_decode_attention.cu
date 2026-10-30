@@ -3,6 +3,7 @@
 // merged by the same stable reduction as the original split decode path.
 #include "tensor_decode_attention.cuh"
 #include "kernels.cuh"
+#include "kv_cache.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -41,7 +42,7 @@ struct Shared {
 };
 static_assert(sizeof(Shared) < 48 * 1024, "tensor decode uses ordinary shared memory");
 
-template<int SplitKeys, bool DevicePosition = false>
+template<int SplitKeys, bool DevicePosition = false, bool Int8 = false>
 __global__ void __launch_bounds__(THREADS) tensor_decode_kernel(
         const float* __restrict__ q, const __half* __restrict__ keys,
         const __half* __restrict__ values, float* __restrict__ scratch,
@@ -89,8 +90,13 @@ __global__ void __launch_bounds__(THREADS) tensor_decode_kernel(
             uint4 key = make_uint4(0, 0, 0, 0), value = key;
             if (row < count) {
                 const size_t offset = ((size_t) (first + row) * kKvHeads + kvh) * HD;
-                key = __ldg(reinterpret_cast<const uint4*>(keys + offset) + piece);
-                value = __ldg(reinterpret_cast<const uint4*>(values + offset) + piece);
+                if constexpr (Int8) {
+                    key = kv::detail::load8(keys, offset / HD, piece);
+                    value = kv::detail::load8(values, offset / HD, piece);
+                } else {
+                    key = __ldg(reinterpret_cast<const uint4*>(keys + offset) + piece);
+                    value = __ldg(reinterpret_cast<const uint4*>(values + offset) + piece);
+                }
             }
             *reinterpret_cast<uint4*>(&s.k[row][piece * 8]) = key;
             *reinterpret_cast<uint4*>(&s.v[row][piece * 8]) = value;
@@ -278,5 +284,33 @@ void tensor_decode_attention_q8_graph(const float* q, const uint16_t* keys, cons
     if (error != cudaSuccess)
         throw std::runtime_error("Kolibri graph tensor decode: " + std::string(cudaGetErrorString(error)));
     attention_merge_partials_q8_graph(scratch, output, q8, position, split, parts, stream);
+}
+void tensor_decode_attention_int8(const float* q, const void* keys, const void* values,
+                                  float* output, float* scratch, int key_count, void* stream,
+                                  void* q8, const int32_t* position) {
+    tensor_decode_attention_scratch_floats(key_count);
+    if (!scratch || (position && !q8))
+        throw std::invalid_argument("Kolibri INT8 decode requires scratch and graph Q8 output");
+    const int split = partition_keys(key_count, false), parts = (key_count + split - 1) / split;
+    if (position) {
+        if (split == 32)
+            tensor_decode_kernel<32, true, true><<<dim3(parts, kKvHeads), THREADS, 0, (cudaStream_t) stream>>>(
+                q, (const __half*) keys, (const __half*) values, scratch, 0, 0, position);
+        else
+            tensor_decode_kernel<128, true, true><<<dim3(parts, kKvHeads), THREADS, 0, (cudaStream_t) stream>>>(
+                q, (const __half*) keys, (const __half*) values, scratch, 0, 0, position);
+    } else {
+        if (split == 32)
+            tensor_decode_kernel<32, false, true><<<dim3(parts, kKvHeads), THREADS, 0, (cudaStream_t) stream>>>(
+                q, (const __half*) keys, (const __half*) values, scratch, key_count, parts);
+        else
+            tensor_decode_kernel<128, false, true><<<dim3(parts, kKvHeads), THREADS, 0, (cudaStream_t) stream>>>(
+                q, (const __half*) keys, (const __half*) values, scratch, key_count, parts);
+    }
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error("Kolibri INT8 decode: " + std::string(cudaGetErrorString(error)));
+    if (position) attention_merge_partials_q8_graph(scratch, output, q8, position, split, parts, stream);
+    else if (q8) attention_merge_partials_q8(scratch, output, q8, parts, stream);
+    else attention_merge_partials(scratch, output, parts, stream);
 }
 }  // namespace strata::kolibri::kernels
