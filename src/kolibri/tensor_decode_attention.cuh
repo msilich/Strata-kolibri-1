@@ -21,5 +21,11 @@ void tensor_decode_attention(const float* q, const uint16_t* kcache, const uint1
 // and does not alias any attention input, partial or F32 output buffer.
 void tensor_decode_attention_q8(const float* q, const uint16_t* kcache, const uint16_t* vcache,
                                 float* out, float* scratch, int key_count, bool local, void* stream, void* q8);
+// Global graph variant. The validated device position stays below max_key_count
+// and on its side of the 8192-key partition boundary. Unused blocks exit before
+// reading KV; scratch and merge use the actual partition count and order.
+void tensor_decode_attention_q8_graph(const float* q, const uint16_t* kcache, const uint16_t* vcache,
+                                      float* out, float* scratch, const int32_t* position,
+                                      int max_key_count, void* stream, void* q8);
 
 }  // namespace strata::kolibri::kernels

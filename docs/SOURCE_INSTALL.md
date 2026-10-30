@@ -350,6 +350,21 @@ windows keep their existing path. Like the tensor-core prompt path, it uses
 paired half-precision queries and probabilities, changes rounding, and can
 change generated tokens. It is off by default.
 
+`--decode-graphs` optionally captures a complete single-token GPU workflow and
+replays it during generation. Add it to the run config's `args`; setup does not
+enable it. It requires `--gpu-expert-cache --tensor-decode-attention` and their
+prerequisites. It cannot be combined with `--profile` or layer/router dumps;
+full-logit output remains available. The first real decode warms the kernels,
+and local windows shorter than 513 keys keep the ordinary path. Prompt
+processing is unchanged.
+
+The graph reads the current token position from device memory. It preserves the
+existing attention reductions, expert selection and cache updates. It is rebuilt
+at attention partition boundaries, for a new request, and before KV growth can
+replace expert-cache addresses. Capture and rebuilding add work, so measure the
+flag on the intended GPU and workload before keeping it enabled. Validation so
+far is on an RTX 5090; other model paths and their defaults are unchanged.
+
 The custom workload runner in `tools/kolibri/benchmark.py` compares German and
 English synthetic project dossiers and pinned source-code excerpts. It prepares
 four input sizes per workload, reserving 256 output tokens within 2k, 8k, 16k

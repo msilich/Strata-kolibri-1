@@ -1001,6 +1001,25 @@ void Executor::experts_decode(int layer, const int32_t* experts, const float* x,
 void Executor::begin_gpu_decode() { impl_->begin_gpu(); }
 void Executor::complete_gpu_decode() { impl_->complete_gpu(); }
 
+void Executor::gpu_decode_graph_submitted() {
+    auto& p = *impl_;
+    if (!p.gpu_active || p.gpu_aux_unfenced || p.gpu_prepared_layer >= 0 ||
+        (p.gpu_pending_layers != 0 && p.gpu_pending_layers != kLayers))
+        throw std::runtime_error("Kolibri: invalid graph receipt bookkeeping");
+    p.gpu_pending_layers = kLayers;
+    p.prefill_sequence = false;
+}
+
+void Executor::cancel_gpu_decode_capture() {
+    auto& p = *impl_;
+    p.gpu_active = false;
+    p.gpu_pending_layers = 0;
+    p.gpu_aux_unfenced = false;
+    p.gpu_prepared_layer = -1;
+    p.gpu_cache_current = false;
+    p.prefill_sequence = false;
+}
+
 void Executor::prepare_experts_decode_gpu(int layer, const float* logits, const float* bias,
                                           int32_t* route_ids, float* route_weights) {
     auto& p = *impl_;

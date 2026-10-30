@@ -189,6 +189,49 @@ void run_case(const Case& c, cudaStream_t stream, bool benchmark) {
         if (c.variant == 3) require(std::abs(actual[0]) > 1.f, "P low-half contribution was lost");
     }
 }
+void graph_replay(cudaStream_t stream) {
+    constexpr int Guard = 32, Q8Bytes = Q / 32 * 36;
+    constexpr float Sentinel = -12345.f;
+    for (int limit : {8191, 9216, 32768}) {
+        auto key_values = random_values((size_t) limit * KV, 221);
+        auto value_values = random_values(key_values.size(), 222);
+        std::vector<uint16_t> keys(key_values.size()), values(key_values.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            keys[i] = half_bits(key_values[i]); values[i] = half_bits(value_values[i]);
+        }
+        Device<float> q(random_values(Q, 220));
+        Device<uint16_t> dk(keys), dv(values);
+        Device<int32_t> position(std::vector<int32_t>{limit - 1});
+        Device<float> eager(std::vector<float>(Q + Guard, Sentinel)), output(std::vector<float>(Q + Guard, Sentinel));
+        const size_t size = k::tensor_decode_attention_scratch_floats(limit);
+        Device<float> scratch(std::vector<float>(size + Guard, Sentinel));
+        Device<uint8_t> eager_q8(std::vector<uint8_t>(Q8Bytes + Guard, 0xa5));
+        Device<uint8_t> graph_q8(std::vector<uint8_t>(Q8Bytes + Guard, 0xa5));
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        k::tensor_decode_attention_q8_graph(q.p, dk.p, dv.p, output.p, scratch.p,
+                                            position.p, limit, stream, graph_q8.p);
+        check(cudaStreamEndCapture(stream, &graph));
+        check(cudaGraphInstantiate(&executable, graph, 0));
+        const std::vector<int> positions = limit == 8191 ? std::vector<int>{512, 1023, 1024, 7936, 8190}
+                                                        : std::vector<int>{limit - 129, limit - 128, limit - 1};
+        for (int pos : positions) {
+            check(cudaMemcpy(position.p, &pos, sizeof(pos), cudaMemcpyHostToDevice));
+            k::tensor_decode_attention_q8(q.p, dk.p, dv.p, eager.p, scratch.p, pos + 1, false, stream, eager_q8.p);
+            check(cudaGraphLaunch(executable, stream)); check(cudaStreamSynchronize(stream));
+            const auto expected = eager.download(), actual = output.download();
+            require(!std::memcmp(expected.data(), actual.data(), actual.size() * sizeof(float)),
+                    "graph attention changed output or guards at dynamic key count");
+            require(eager_q8.download() == graph_q8.download(), "graph attention changed Q8 bytes or guards");
+            const auto partials = scratch.download();
+            for (size_t i = size; i < partials.size(); ++i)
+                require(partials[i] == Sentinel, "graph attention exceeded scratch capacity");
+        }
+        check(cudaGraphExecDestroy(executable)); check(cudaGraphDestroy(graph));
+        std::printf("PASS graph attention replay, limit=%d, dynamic partition count and Q8 bytes\n", limit);
+    }
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -206,6 +249,7 @@ int main(int argc, char** argv) {
                                 Case{"global 32K", 1, 32768, 0, 32767, false},
                                 Case{"local full window", 1, 513, 0, 512, true}}) run_case(c, stream, true);
         } else {
+            graph_replay(stream);
             for (int keys : {1, 31, 32, 33, 2048, 8191, 8192, 8193, 32768, 32769, 262144})
                 run_case(Case{"global causal prefix", 1, keys, 0, keys - 1, false}, stream, false);
             for (const Case c : {Case{"local singleton last partition", 1, 513, 0, 512, true},

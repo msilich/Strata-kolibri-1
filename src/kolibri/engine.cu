@@ -160,7 +160,7 @@ public:
     Blas blas{stream.value};
     Model model;
     const int context, chunk;
-    const bool split_attention, split_local_attention, grouped_experts, fast_prefill, fused_decode, tensor_decode, gpu_greedy, gpu_expert_cache, kv_grow, overlap_decode_cache, two_query_prefill;
+    const bool split_attention, split_local_attention, grouped_experts, fast_prefill, fused_decode, tensor_decode, gpu_greedy, gpu_expert_cache, kv_grow, overlap_decode_cache, two_query_prefill, decode_graphs;
     int64_t pos = 0;
     std::unique_ptr<Executor> exec;
     std::ofstream layer_dump, router_dump, route_ids_dump;
@@ -168,10 +168,10 @@ public:
     Engine(const std::string& path, int ctx, int ch, double cache_gib, int cache_slots, bool profiling, bool split,
            bool split_local, bool grouped, bool decode_cache_lru, bool prefill, bool fused, bool tensor,
            bool grouped_prefill, bool pin_experts, bool greedy, bool overlap_prefill_uploads, bool device_cache, bool grow_kv,
-           bool overlap_decode = false, bool two_query = false)
+           bool overlap_decode = false, bool two_query = false, bool graphs = false)
         : context(ctx), chunk(ch), split_attention(split), split_local_attention(split_local), grouped_experts(grouped),
           fast_prefill(prefill), fused_decode(fused), tensor_decode(tensor), gpu_greedy(greedy), gpu_expert_cache(device_cache), kv_grow(grow_kv),
-          overlap_decode_cache(overlap_decode), two_query_prefill(two_query) {
+          overlap_decode_cache(overlap_decode), two_query_prefill(two_query), decode_graphs(graphs) {
         if (two_query_prefill && !fast_prefill)
             throw std::runtime_error("--two-query-prefill requires --prefill-attention");
         if ((fast_prefill || tensor_decode) && !K::prefill_attention_supported())
@@ -192,6 +192,7 @@ public:
         group_ids.alloc(t); group_weights.alloc(t); gathered.alloc(t * H); expert_out.alloc(t * H);
         if (grouped_experts) grouped_out.alloc(TOP * H);
         ids.alloc(t); logits.alloc(model.vocab);
+        if (decode_graphs) graph_position.alloc(1);
         if (gpu_greedy) {
             greedy_scratch.alloc(strata::kernels::argmax_rows_scratch_bytes(1));
             greedy_status.alloc(strata::kernels::kNonfiniteBlocks + 1);
@@ -236,11 +237,17 @@ public:
 
     // Reset keeps mapped capacity and the current expert cache. Only new token
     // positions grow global KV; local history keeps its existing pointer swaps.
-    void reset() { if (gpu_expert_cache) exec->complete_gpu_decode(); pos = 0; }
+    void reset() {
+        if (gpu_expert_cache) exec->complete_gpu_decode();
+        decode_graph.clear();
+        pos = 0;
+    }
 
     void ensure_kv(int cells) {
         if (!kv_grow || cells <= kv_cells) return;
         if (cells > context) throw std::runtime_error("KV growth exceeds configured context");
+        // A resize can replace the expert cache addresses captured in the graph.
+        decode_graph.clear();
         const int target = std::min(context, (cells + 32767) / 32768 * 32768);
         const int64_t first = kv_chunks(kv_cells), end = kv_chunks(target);
         size_t additional = 0;
@@ -278,9 +285,13 @@ public:
         if (device_decode) exec->begin_gpu_decode();
         try {
         if (profile) profile->begin(pos, T, decode, exec->hits(), exec->misses());
-        ck(transfer.h2d(ids.p, tokens, (size_t) T * sizeof(int32_t), s));
+        const int graph_limit = std::min(context, std::min(pos + 1 < 8192 ? 8191 : context,
+                                                         ((int(pos) + 1 + 1023) / 1024) * 1024));
+        auto enqueue = [&](bool graph) {
+        if (!graph) ck(transfer.h2d(ids.p, tokens, (size_t) T * sizeof(int32_t), s));
         exec->embed(ids.p, x.p, T);
-        if (cache_rope) K::rope_table(rope_sin_cos.p, T, pos, model.rope_base, s);
+        if (graph) K::rope_table_decode_graph(rope_sin_cos.p, graph_position.p, model.rope_base, s);
+        else if (cache_rope) K::rope_table(rope_sin_cos.p, T, pos, model.rope_base, s);
         std::vector<float> dumps;
         std::vector<float> router_dumps;
         std::vector<int32_t> route_ids_dumps;
@@ -306,7 +317,10 @@ public:
             auto& cache = caches[(size_t) l];
             auto* cache_k = kv_grow && !L.local ? reinterpret_cast<uint16_t*>(global_k[l].base()) : cache.k.p;
             auto* cache_v = kv_grow && !L.local ? reinterpret_cast<uint16_t*>(global_v[l].base()) : cache.v.p;
-            if (fuse_decode) {
+            if (graph && !L.local) {
+                K::qk_norm_append_decode_graph(q.p, k.p, v.p, L.q_norm, L.k_norm,
+                                               cache_k, cache_v, graph_position.p, model.eps, s);
+            } else if (fuse_decode) {
                 K::qk_norm_rope_append_decode(q.p, k.p, v.p, L.q_norm, L.k_norm, rope_sin_cos.p,
                                                L.local, cache_k, cache_v, prior, model.eps, s);
             } else {
@@ -318,7 +332,11 @@ public:
             }
             profile_mark(L.local ? ForwardProfile::LocalAttention : ForwardProfile::GlobalAttention);
             bool attention_q8_ready = false;
-            if (two_query_prefill && !decode && !L.local && T >= 2)
+            if (graph && !L.local) {
+                K::tensor_decode_attention_q8_graph(q.p, cache_k, cache_v, attn.p, attention_scratch.p,
+                                                     graph_position.p, graph_limit, s, exec->attention_decode_q8());
+                attention_q8_ready = true;
+            } else if (two_query_prefill && !decode && !L.local && T >= 2)
                 K::prefill_attention_two_query(q.p, cache_k, cache_v, attn.p, T, prior + T, pos, s);
             else if (fast_prefill && !decode)
                 K::prefill_attention(q.p, cache_k, cache_v, attn.p, T, prior + T,
@@ -346,7 +364,7 @@ public:
                 const size_t offset = (size_t) (prior + T - 512) * KV;
                 ck(cudaMemcpyAsync(local_k.p, cache.k.p + offset, bytes, cudaMemcpyDeviceToDevice, s));
                 ck(cudaMemcpyAsync(local_v.p, cache.v.p + offset, bytes, cudaMemcpyDeviceToDevice, s));
-                if (fuse_decode) {
+                if (fuse_decode && !graph) {
                     // Equal-capacity buffers retain unique ownership across reset/prefill.
                     std::swap(cache.k.p, local_k.p); std::swap(cache.v.p, local_v.p);
                 } else {
@@ -512,6 +530,37 @@ public:
         if (!fuse_decode)
             K::rms_norm(x.p + (size_t) (T - 1) * H, model.out_norm, norm.p, 1, H, model.eps, s);
         exec->multiply(model.head, norm.p, logits.p, 1);
+        };
+        const bool use_graph = decode_graphs && device_decode && graph_warmed && pos >= 512;
+        if (use_graph) {
+            // Input staging is outside capture: PinnedRing may rotate its host
+            // buffers. The graph reads only these fixed device allocations.
+            const int32_t position = (int32_t) pos;
+            ck(transfer.h2d(ids.p, tokens, sizeof(int32_t), s));
+            ck(transfer.h2d(graph_position.p, &position, sizeof(position), s));
+            try {
+                if (!decode_graph.executable || decode_graph.limit != graph_limit) {
+                    decode_graph.clear();
+                    decode_graph.capture(s, [&] { enqueue(true); });
+                    decode_graph.limit = graph_limit;
+                    std::fprintf(stderr, "Kolibri decode graph: %zu nodes, global keys <= %d\n",
+                                 decode_graph.nodes, graph_limit);
+                }
+                ck(cudaGraphLaunch(decode_graph.executable, s));
+                exec->gpu_decode_graph_submitted();
+            } catch (...) {
+                // Capture does not execute its cache plans. Never reconcile old
+                // receipts as if a failed capture had processed a real token.
+                exec->cancel_gpu_decode_capture();
+                throw;
+            }
+        } else {
+            // Warm the exact cuBLAS/native decode paths before capturing them.
+            // This is an actual token, so the cache is never advanced speculatively.
+            decode_graph.clear();
+            enqueue(false);
+            if (device_decode) graph_warmed = true;
+        }
         if (profile) profile->end();
         if (device_decode) exec->complete_gpu_decode();
         else ck(cudaStreamSynchronize(s));
@@ -564,6 +613,39 @@ private:
     Buffer<uint32_t> greedy_status;
     strata::core::PinnedRing transfer;
     DecodeRouteDownload route_download;
+    Buffer<int32_t> graph_position;
+    bool graph_warmed = false;
+    struct DecodeGraph {
+        cudaGraphExec_t executable = nullptr;
+        int limit = 0;
+        size_t nodes = 0;
+        ~DecodeGraph() { clear(); }
+        void clear() {
+            if (executable) cudaGraphExecDestroy(executable);
+            executable = nullptr;
+            limit = 0;
+        }
+        template<class Submit> void capture(cudaStream_t stream, Submit submit) {
+            cudaGraph_t graph = nullptr;
+            ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            try { submit(); }
+            catch (...) {
+                cudaStreamEndCapture(stream, &graph);
+                if (graph) cudaGraphDestroy(graph);
+                throw;
+            }
+            const auto ended = cudaStreamEndCapture(stream, &graph);
+            if (ended != cudaSuccess) {
+                if (graph) cudaGraphDestroy(graph);
+                ck(ended);
+            }
+            const auto counted = cudaGraphGetNodes(graph, nullptr, &nodes);
+            if (counted != cudaSuccess) { cudaGraphDestroy(graph); ck(counted); }
+            const auto instantiated = cudaGraphInstantiate(&executable, graph, 0);
+            cudaGraphDestroy(graph);
+            ck(instantiated);
+        }
+    } decode_graph;
 };
 
 std::vector<int32_t> parse_ids(const std::string& text) {
@@ -791,7 +873,7 @@ int main(int argc, char** argv) {
              grouped_experts = false, decode_cache_lru = false, prefill_attention = false,
              fused_decode = false, tensor_decode_attention = false, grouped_prefill = false, pin_experts = false,
              gpu_greedy = false, overlap_prefill_uploads = false, gpu_expert_cache = false, kv_grow = false,
-             overlap_decode_cache = false, two_query_prefill = false;
+             overlap_decode_cache = false, two_query_prefill = false, decode_graphs = false;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             auto next = [&]() -> std::string {
@@ -822,6 +904,7 @@ int main(int argc, char** argv) {
                              "  --two-query-prefill (share global prompt attention work across token pairs; requires --prefill-attention)\n"
                              "  --fused-decode (experimental combined decode projections and residual norms)\n"
                              "  --tensor-decode-attention (experimental tensor-core decode attention; CUDA sm_80+)\n";
+                std::cout << "  --decode-graphs (optional token graph; requires device cache and tensor decode attention)\n";
                 return 0;
             } else if (arg == "--native" || arg == "--model") model = next();
             else if (arg == "--max-context") ctx = std::stoi(next());
@@ -852,6 +935,7 @@ int main(int argc, char** argv) {
             else if (arg == "--two-query-prefill") two_query_prefill = true;
             else if (arg == "--fused-decode") fused_decode = true;
             else if (arg == "--tensor-decode-attention") tensor_decode_attention = true;
+            else if (arg == "--decode-graphs") decode_graphs = true;
             else throw std::runtime_error("unknown option: " + arg);
         }
         if (model.empty() || ctx < 1 || ctx > 262144 || chunk < 1 || chunk > K::kChunk || n < 1 ||
@@ -868,6 +952,9 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--gpu-expert-cache requires --pin-experts --grouped-experts --decode-cache-lru --fused-decode");
         if (overlap_decode_cache && !(gpu_expert_cache && overlap_prefill_uploads))
             throw std::runtime_error("--overlap-decode-cache requires --gpu-expert-cache --overlap-prefill-uploads");
+        if (decode_graphs && (!gpu_expert_cache || !tensor_decode_attention || profiling ||
+                              !layer_path.empty() || !router_path.empty() || !route_ids_path.empty()))
+            throw std::runtime_error("--decode-graphs requires --gpu-expert-cache --tensor-decode-attention and no --profile or layer/router dumps");
         auto ids = server ? std::vector<int32_t>{} : parse_ids(tokens);
         auto force = forced.empty() ? std::vector<int32_t>{} : parse_ids(forced);
         if (!force.empty()) n = (int) force.size() + 1;
@@ -877,7 +964,7 @@ int main(int argc, char** argv) {
         Engine engine(model, ctx, chunk, vram, slots, profiling, split_attention, split_local_attention,
                       grouped_experts, decode_cache_lru, prefill_attention, fused_decode, tensor_decode_attention,
                       grouped_prefill, pin_experts, gpu_greedy, overlap_prefill_uploads, gpu_expert_cache, kv_grow,
-                      overlap_decode_cache, two_query_prefill);
+                      overlap_decode_cache, two_query_prefill, decode_graphs);
         if (server) return serve(engine);
         if (!layer_path.empty()) {
             engine.layer_dump.open(layer_path, std::ios::binary);

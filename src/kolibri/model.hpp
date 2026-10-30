@@ -95,6 +95,10 @@ public:
                             float* outputs, const float* route_weights, float* destination,
                             const void* input_q8);
     void complete_gpu_decode();
+    // Graph replay enqueues all fifty layers without repeating their host-side
+    // receipt bookkeeping. Capture itself executes nothing and may be cancelled.
+    void gpu_decode_graph_submitted();
+    void cancel_gpu_decode_capture();
     // Opt-in KV growth boundary: drain both streams, validate the full remaining
     // KV commitment, and empty/reopen a smaller cache only when VRAM is needed.
     // Counters/tick and pinned source arenas survive; no work may be queued here.

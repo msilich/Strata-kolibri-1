@@ -28,6 +28,8 @@ void qk_norm_rope(float* q, float* k, const float* qw, const float* kw, int rows
 // for 64 NeoX pairs per row. Prepare once for the forward's absolute positions;
 // reuse across local layers on the same stream. Table must not alias Q/K/weights.
 void rope_table(float* sin_cos, int rows, int64_t first_pos, float theta, void* stream);
+// Graph variants read the validated absolute position from device memory.
+void rope_table_decode_graph(float* sin_cos, const int32_t* position, float theta, void* stream);
 void qk_norm_rope_cached(float* q, float* k, const float* qw, const float* kw, int rows,
                          const float* sin_cos, float eps, void* stream);
 // Opt-in T=1 equivalent of QK norm/RoPE followed by KV append. Local layers
@@ -36,6 +38,9 @@ void qk_norm_rope_cached(float* q, float* k, const float* qw, const float* kw, i
 void qk_norm_rope_append_decode(float* q, float* k, const float* v, const float* qw, const float* kw,
                                 const float* sin_cos, bool local, uint16_t* kcache, uint16_t* vcache,
                                 int dst_offset, float eps, void* stream);
+void qk_norm_append_decode_graph(float* q, float* k, const float* v, const float* qw, const float* kw,
+                                uint16_t* kcache, uint16_t* vcache, const int32_t* position,
+                                float eps, void* stream);
 // k/v [rows,4,128] into token-major caches beginning at dst_offset.
 void append_kv(const float* k, const float* v, uint16_t* kcache, uint16_t* vcache,
                int rows, int dst_offset, void* stream);
@@ -72,6 +77,8 @@ void attention_merge_partials(const float* scratch, float* out, int parts, void*
 // Same F32 merge plus its native Q8_1 image (192 blocks, 6912 bytes).
 // q8 is disjoint from the input partials and F32 output.
 void attention_merge_partials_q8(const float* scratch, float* out, void* q8, int parts, void* stream);
+void attention_merge_partials_q8_graph(const float* scratch, float* out, void* q8,
+                                       const int32_t* position, int split, int max_parts, void* stream);
 
 // Finite logits [rows,384], selection bias [384], outputs [rows,6]. Selection is
 // descending logits+bias, ties to lower expert ID. Weights are unbiased sigmoid;

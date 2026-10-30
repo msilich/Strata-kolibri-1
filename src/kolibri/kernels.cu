@@ -96,6 +96,16 @@ __global__ void rope_table_kernel(float* sin_cos, int rows, int64_t first_pos, f
     sin_cos[2 * pair + 1] = (float) cosine;
 }
 
+__global__ void rope_table_decode_graph_kernel(float* sin_cos, const int32_t* position, float theta) {
+    const int pair = threadIdx.x;
+    if (pair >= kHeadDim / 2) return;
+    const double angle = (double) *position * pow((double) theta, -2.0 * pair / kHeadDim);
+    double sine, cosine;
+    sincos(angle, &sine, &cosine);
+    sin_cos[2 * pair] = (float) sine;
+    sin_cos[2 * pair + 1] = (float) cosine;
+}
+
 __global__ void qk_cached_kernel(float* q, float* k, const float* qw, const float* kw,
                                  const float* sin_cos, float eps) {
     // Keep qk_kernel's reduction and normalization order unchanged.
@@ -123,10 +133,12 @@ __global__ void qk_cached_kernel(float* q, float* k, const float* qw, const floa
 
 // T=1 only. Preserve the original norm/RoPE arithmetic and write the same
 // F32 Q/K values while the four K heads also append their F16 K/V values.
-template <bool Local>
+template <bool Local, bool DevicePosition = false>
 __global__ void qk_append_decode_kernel(float* q, float* k, const float* v,
                                         const float* qw, const float* kw, const float* sin_cos,
-                                        __half* kc, __half* vc, size_t offset, float eps) {
+                                        __half* kc, __half* vc, size_t offset, float eps,
+                                        const int32_t* position = nullptr) {
+    if constexpr (DevicePosition) offset = (size_t) *position * kKvHeads * kHeadDim;
     __shared__ float sums[kHeadDim], normalized[kHeadDim];
     const int i = threadIdx.x, h = blockIdx.y;
     const bool query = h < kQueryHeads;
@@ -396,7 +408,10 @@ __global__ void swiglu_q8_kernel(const float* __restrict__ gate, const float* __
     if (i % 32 == 0) q8[i / 32].ds = strata::kernels::q8_1_ds(d, sum);
 }
 
-__global__ void attention_split_merge_q8(const float* scratch, float* out, block_q8_1* q8, int parts) {
+template<bool DevicePosition = false>
+__global__ void attention_split_merge_q8(const float* scratch, float* out, block_q8_1* q8, int parts,
+                                         const int32_t* position = nullptr, int split = 0) {
+    if constexpr (DevicePosition) parts = (*position + 1 + split - 1) / split;
     const int i = threadIdx.x;
     const float xi = attention_merge_value(scratch, parts);
     out[(size_t) blockIdx.x * kHeadDim + i] = xi;
@@ -461,6 +476,11 @@ void rope_table(float* sin_cos, int rows, int64_t first_pos, float theta, void* 
     checked("RoPE table");
 }
 
+void rope_table_decode_graph(float* sin_cos, const int32_t* position, float theta, void* stream) {
+    rope_table_decode_graph_kernel<<<1, 64, 0, (cudaStream_t) stream>>>(sin_cos, position, theta);
+    checked("graph RoPE table");
+}
+
 void qk_norm_rope_cached(float* q, float* k, const float* qw, const float* kw, int rows,
                          const float* sin_cos, float eps, void* stream) {
     if (rows < 1 || rows > kChunk || eps <= 0.f)
@@ -486,6 +506,13 @@ void qk_norm_rope_append_decode(float* q, float* k, const float* v, const float*
     checked("decode QK norm/RoPE and KV append");
 }
 
+
+void qk_norm_append_decode_graph(float* q, float* k, const float* v, const float* qw, const float* kw,
+                                uint16_t* kc, uint16_t* vc, const int32_t* position, float eps, void* stream) {
+    qk_append_decode_kernel<false, true><<<dim3(1, kQueryHeads + kKvHeads), kHeadDim, 0, (cudaStream_t) stream>>>(
+        q, k, v, qw, kw, nullptr, (__half*) kc, (__half*) vc, 0, eps, position);
+    checked("graph QK norm and KV append");
+}
 
 void append_kv(const float* k, const float* v, uint16_t* kc, uint16_t* vc, int rows, int dst_offset, void* stream) {
     if (rows < 1 || rows > kChunk || dst_offset < 0) throw std::invalid_argument("Kolibri KV append: invalid shape or offset");
@@ -551,9 +578,16 @@ void attention_merge_partials(const float* scratch, float* out, int parts, void*
 
 void attention_merge_partials_q8(const float* scratch, float* out, void* q8, int parts, void* stream) {
     if (!q8) throw std::invalid_argument("Kolibri merge Q8 requires output scratch");
-    attention_split_merge_q8<<<kQueryHeads, kHeadDim, (size_t) parts * sizeof(float), (cudaStream_t) stream>>>(
+    attention_split_merge_q8<><<<kQueryHeads, kHeadDim, (size_t) parts * sizeof(float), (cudaStream_t) stream>>>(
         scratch, out, static_cast<block_q8_1*>(q8), parts);
     checked("attention merge Q8");
+}
+
+void attention_merge_partials_q8_graph(const float* scratch, float* out, void* q8,
+                                       const int32_t* position, int split, int max_parts, void* stream) {
+    attention_split_merge_q8<true><<<kQueryHeads, kHeadDim, (size_t) max_parts * sizeof(float), (cudaStream_t) stream>>>(
+        scratch, out, static_cast<block_q8_1*>(q8), 0, position, split);
+    checked("graph attention merge Q8");
 }
 
 void route(const float* logits, const float* bias, int32_t* ids, float* weights, int rows, void* stream) {

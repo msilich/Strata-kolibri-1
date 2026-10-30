@@ -303,6 +303,51 @@ void qk_append_decode(cudaStream_t stream) {
                 "decode QK append modifies V source");
         std::printf("PASS decode QK/KV bitwise, local=%d position=%lld offset=%d, guards and V source\n",
                     test.local, (long long) test.position, test.offset);
+
+        Device<int32_t> position(std::vector<int32_t>{(int32_t) test.position});
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        k::rope_table_decode_graph(table.p, position.p, theta, stream);
+        if (test.local)
+            k::qk_norm_rope_append_decode(fused_q.p + guard, fused_k.p + guard, dv.p + guard,
+                                          dqw.p, dkw.p, table.p, true, kc.p, vc.p, test.offset, eps, stream);
+        else
+            k::qk_norm_append_decode_graph(fused_q.p + guard, fused_k.p + guard, dv.p + guard,
+                                            dqw.p, dkw.p, kc.p, vc.p, position.p, eps, stream);
+        check(cudaStreamEndCapture(stream, &graph));
+        check(cudaGraphInstantiate(&executable, graph, 0));
+        for (int step = 0; step < 2; ++step) {
+            const int32_t next = (int32_t) test.position + (step ? (test.position == 262143 ? -1 : 1) : 0);
+            position.upload({next});
+            reference_q.upload(q); reference_k.upload(keys);
+            fused_q.upload(q); fused_k.upload(keys); kc.upload(initial); vc.upload(initial);
+            k::rope_table(table.p, 1, next, theta, stream);
+            check(cudaStreamSynchronize(stream));
+            const auto expected_angles = table.download();
+            if (test.local)
+                k::qk_norm_rope_cached(reference_q.p + guard, reference_k.p + guard, dqw.p, dkw.p,
+                                       1, table.p, eps, stream);
+            else
+                k::qk_norm_rope(reference_q.p + guard, reference_k.p + guard, dqw.p, dkw.p,
+                                1, next, false, theta, eps, stream);
+            k::append_kv(reference_k.p + guard, dv.p + guard, kc.p, vc.p, 1,
+                          test.local ? test.offset : next, stream);
+            check(cudaStreamSynchronize(stream));
+            const auto graph_expected_k = kc.download(), graph_expected_v = vc.download();
+            kc.upload(initial); vc.upload(initial);
+            check(cudaGraphLaunch(executable, stream)); check(cudaStreamSynchronize(stream));
+            const auto graph_q = fused_q.download(), graph_k = fused_k.download();
+            const auto ref_q = reference_q.download(), ref_k = reference_k.download();
+            require(table.download() == expected_angles, "graph RoPE position did not advance");
+            require(!std::memcmp(ref_q.data(), graph_q.data(), ref_q.size() * sizeof(float)) &&
+                    !std::memcmp(ref_k.data(), graph_k.data(), ref_k.size() * sizeof(float)),
+                    "graph QK differs from eager normalization");
+            require(kc.download() == graph_expected_k && vc.download() == graph_expected_v,
+                    "graph KV append used stale position or changed guards");
+        }
+        check(cudaGraphExecDestroy(executable)); check(cudaGraphDestroy(graph));
+        std::puts("PASS graph replay advances RoPE and global KV position bitwise");
     }
 }
 
