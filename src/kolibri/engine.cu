@@ -244,10 +244,12 @@ public:
 
     // Reset keeps mapped capacity and the current expert cache. Only new token
     // positions grow global KV; local history keeps its existing pointer swaps.
-    void reset() {
+    // Reuse is valid only for an exact extension of every processed token. A
+    // shorter common prefix cannot restore the overwritten local KV windows.
+    void reset(bool reuse_prefix = false) {
         if (gpu_expert_cache) exec->complete_gpu_decode();
         decode_graph.clear();
-        pos = 0;
+        if (!reuse_prefix) pos = 0;
     }
 
     void ensure_kv(int cells) {
@@ -782,6 +784,7 @@ private:
 
 struct Request {
     int max_new = 0, logprobs = -1;
+    bool checkpoint = true;
     Sampling sampling;
     std::vector<int32_t> ids, allowed;
     std::vector<float> bias;
@@ -812,10 +815,11 @@ Request request(const std::string& line, int vocab, int ctx) {
         else if (key == "seed") r.sampling.seed = std::stoull(v);
         else if (key == "logprobs") r.logprobs = std::stoi(v);
         else if (key == "allowed") r.allowed = parse_ids(v);
+        else if (key == "ckpt") r.checkpoint = v != "0";
         else if (key == "logit_bias") {
             std::string error;
             if (!strata::core::parse_logit_bias(v, vocab, r.bias, error)) throw std::runtime_error(error);
-        } else if (key != "ckpt" && key != "pin" && key != "cvec")
+        } else if (key != "pin" && key != "cvec")
             throw std::runtime_error("unsupported request option: " + key);
     }
     const auto& p = r.sampling;
@@ -830,12 +834,15 @@ Request request(const std::string& line, int vocab, int ctx) {
     return r;
 }
 
-int serve(Engine& engine) {
-    std::printf("INFO family=kolibri1 sampling_top_k=128 batch_slots=0\nREADY %d stop\n", engine.context);
+template<class ModelEngine>
+int serve(ModelEngine& engine, bool prefix_cache = false) {
+    std::printf("INFO family=kolibri1 sampling_top_k=128 batch_slots=0%s\nREADY %d stop\n",
+                 prefix_cache ? " prefix_cache=1" : "", engine.context);
     std::fflush(stdout);
     Input input;
     Input::Command command;
     std::vector<float> lg;
+    std::vector<int32_t> prefix;
     while (input.next(command)) {
         if (command.line.empty()) continue;
         Request r;
@@ -845,13 +852,26 @@ int serve(Engine& engine) {
         const auto& sampling = r.sampling;
         const bool gpu_pick = engine.gpu_greedy && sampling.temperature == 0.f && r.bias.empty() && r.logprobs < 0 &&
             (sampling.last_n == 0 || (sampling.repeat == 1.f && sampling.freq == 0.f && sampling.present == 0.f));
-        engine.reset();
+        size_t reused = 0;
+        if (prefix_cache && engine.pos == (int64_t) prefix.size() && prefix.size() <= r.ids.size() &&
+            std::equal(prefix.begin(), prefix.end(), r.ids.begin())) reused = prefix.size();
+        engine.reset(reused != 0);
+        if (prefix_cache) {
+            if (!reused) prefix.clear();
+            prefix.reserve(r.ids.size() + (size_t) r.max_new);
+        }
         auto start = Clock::now();
-        size_t read = 0;
+        if (reused) {
+            std::printf("RESUME %zu\n", reused);
+            std::fflush(stdout);
+        }
+        size_t read = reused;
         while (read < r.ids.size() && !cancelled()) {
             const int n = (int) std::min<size_t>(engine.chunk, r.ids.size() - read);
-            engine.forward(r.ids.data() + read, n); read += n;
-            std::printf("PP %zu %zu %.0f %.1f\n", read, r.ids.size(), ms(start), 1000.0 * read / std::max(ms(start), 0.001));
+            engine.forward(r.ids.data() + read, n);
+            if (prefix_cache) prefix.insert(prefix.end(), r.ids.data() + read, r.ids.data() + read + n);
+            read += n;
+            std::printf("PP %zu %zu %.0f %.1f\n", read, r.ids.size(), ms(start), 1000.0 * (read - reused) / std::max(ms(start), 0.001));
             std::fflush(stdout);
         }
         const double prefill_ms = ms(start);
@@ -875,15 +895,23 @@ int serve(Engine& engine) {
             std::fflush(stdout);
             ++produced; history.push_back(token);
             if (token == engine.model.eos) { finish = "stop"; break; }
-            if (produced < r.max_new && !cancelled()) engine.forward(&history.back(), 1, true);
+            if (produced < r.max_new && !cancelled()) {
+                engine.forward(&history.back(), 1, true);
+                // The final emitted token and EOS have no KV until a later
+                // request actually forwards them. STOP may also leave a token
+                // emitted but unprocessed, so commit only after forward returns.
+                if (prefix_cache) prefix.push_back(history.back());
+            }
         }
         if (cancelled()) finish = "cancel";
-        std::printf("DONE %d %zu %.1f %.1f %s 0 0 0 0 0 0 0 0.0 %zu 0\n", produced, r.ids.size(), prefill_ms,
-                     ms(decode), finish.c_str(), read);
+        if (prefix_cache && !r.checkpoint) prefix.clear();
+        std::printf("DONE %d %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %zu 0\n", produced, r.ids.size(), prefill_ms,
+                     ms(decode), finish.c_str(), reused, read - reused);
         std::fflush(stdout);
         std::fprintf(stderr, "Kolibri: %zu prompt tokens / %.0f ms; %d output tokens / %.0f ms; cache hits=%llu misses=%llu\n",
-                     read, prefill_ms, produced, ms(decode), (unsigned long long) engine.exec->hits(),
+                     read - reused, prefill_ms, produced, ms(decode), (unsigned long long) engine.exec->hits(),
                      (unsigned long long) engine.exec->misses());
+        if (prefix_cache) std::fprintf(stderr, "Kolibri prefix cache: %zu reused; %zu processed tokens retained\n", reused, prefix.size());
     }
     return 0;
 }
@@ -899,7 +927,7 @@ int main(int argc, char** argv) {
              grouped_experts = false, decode_cache_lru = false, prefill_attention = false,
              fused_decode = false, tensor_decode_attention = false, grouped_prefill = false, pin_experts = false,
              gpu_greedy = false, overlap_prefill_uploads = false, gpu_expert_cache = false, kv_grow = false,
-             overlap_decode_cache = false, two_query_prefill = false, decode_graphs = false;
+             overlap_decode_cache = false, two_query_prefill = false, decode_graphs = false, prefix_cache = false;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             auto next = [&]() -> std::string {
@@ -932,6 +960,7 @@ int main(int argc, char** argv) {
                              "  --fused-decode (experimental combined decode projections and residual norms)\n"
                              "  --tensor-decode-attention (experimental tensor-core decode attention; CUDA sm_80+)\n";
                 std::cout << "  --decode-graphs (optional token graph; requires device cache and tensor decode attention)\n";
+                std::cout << "  --prefix-cache (optional exact continuation of the last processed conversation; --serve only)\n";
                 return 0;
             } else if (arg == "--native" || arg == "--model") model = next();
             else if (arg == "--max-context") ctx = std::stoi(next());
@@ -964,6 +993,7 @@ int main(int argc, char** argv) {
             else if (arg == "--fused-decode") fused_decode = true;
             else if (arg == "--tensor-decode-attention") tensor_decode_attention = true;
             else if (arg == "--decode-graphs") decode_graphs = true;
+            else if (arg == "--prefix-cache") prefix_cache = true;
             else throw std::runtime_error("unknown option: " + arg);
         }
         if (model.empty() || (kv_type != "fp16" && kv_type != "int8") || ctx < 1 || ctx > 262144 || chunk < 1 || chunk > K::kChunk || n < 1 ||
@@ -983,6 +1013,7 @@ int main(int argc, char** argv) {
         if (decode_graphs && (!gpu_expert_cache || !tensor_decode_attention || profiling ||
                               !layer_path.empty() || !router_path.empty() || !route_ids_path.empty()))
             throw std::runtime_error("--decode-graphs requires --gpu-expert-cache --tensor-decode-attention and no --profile or layer/router dumps");
+        if (prefix_cache && !server) throw std::runtime_error("--prefix-cache requires --serve");
         auto ids = server ? std::vector<int32_t>{} : parse_ids(tokens);
         auto force = forced.empty() ? std::vector<int32_t>{} : parse_ids(forced);
         if (!force.empty()) n = (int) force.size() + 1;
@@ -993,7 +1024,7 @@ int main(int argc, char** argv) {
                       grouped_experts, decode_cache_lru, prefill_attention, fused_decode, tensor_decode_attention,
                       grouped_prefill, pin_experts, gpu_greedy, overlap_prefill_uploads, gpu_expert_cache, kv_grow,
                       overlap_decode_cache, two_query_prefill, decode_graphs, kv_type == "int8");
-        if (server) return serve(engine);
+        if (server) return serve(engine, prefix_cache);
         if (!layer_path.empty()) {
             engine.layer_dump.open(layer_path, std::ios::binary);
             if (!engine.layer_dump) throw std::runtime_error("cannot open layer dump");

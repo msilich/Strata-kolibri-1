@@ -1,8 +1,10 @@
 """Kolibri chat, reasoning and native JSON tools without model weights or a GPU."""
 import io
 import json
+import os
 from pathlib import Path
 import queue
+import subprocess
 import tempfile
 import threading
 from types import SimpleNamespace
@@ -120,6 +122,246 @@ class KolibriEngineProtocol(unittest.TestCase):
             self.assertEqual(list(engine.generate([1], 1, model_card_sampling("kolibri1", True),
                                                    threading.Event())), [72])
             self.assertIn(f" top_k={expected} ", engine.proc.stdin.getvalue())
+
+
+PROTOCOL_TEST = Path(os.environ.get("STRATA_KOLIBRI_PROTOCOL_TEST",
+                                  Path(__file__).resolve().parents[1] / "build/kolibri-protocol-test"))
+
+
+class KolibriPrefixTemplate(unittest.TestCase):
+    def test_history_stays_an_exact_extension_only_when_opted_in(self):
+        # The model template drops old thinking unless preserve_thinking is on.
+        source = '''{%- for m in messages -%}
+{{- '<|im_start|>' + m.role + '\\n' -}}
+{%- if m.role == 'assistant' and preserve_thinking|default(false) -%}
+{{- '<think>\\n' + m.reasoning_content|default('') + '\\n</think>\\n\\n' -}}
+{%- endif -%}
+{{- m.content + '<|im_end|>\\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<|im_start|>assistant\\n' -}}
+{%- if enable_thinking is defined and not enable_thinking -%}{{- '<think>\\n\\n</think>\\n\\n' -}}{%- endif -%}
+{%- endif -%}'''
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "template.jinja"
+            path.write_text(source)
+            svc = Service.__new__(Service)
+            svc.effort_end = False
+            svc.template = F.ChatTemplate(path, "kolibri1")
+            user = {"role": "user", "content": "Question"}
+            for off, reasoning in ((True, ""), (False, "Thinking.")):
+                kwargs = {"enable_thinking": not off}
+                initial = svc.template.render([user], **kwargs)
+                answer = "Answer" if off else "<think>\nThinking.\n</think>\n\nAnswer"
+                history = [user, {"role": "assistant", "content": "Answer", "reasoning_content": reasoning},
+                           {"role": "user", "content": "Next"}]
+                expected = initial + answer + "<|im_end|>\n"
+                for family, info in (("kolibri1", {}), ("qwen4exp", {"prefix_cache": 1}),
+                                     ("kolibri1", {"prefix_cache": 1})):
+                    svc.family, svc.engine = family, SimpleNamespace(info=info)
+                    actual = svc.render_prompt(history, None, kwargs)
+                    if family == "kolibri1" and info.get("prefix_cache") == 1:
+                        self.assertTrue(actual.startswith(expected))
+                        explicit = svc.render_prompt(history, None, {**kwargs, "preserve_thinking": False})
+                        self.assertEqual(explicit, svc.template.render(history, **kwargs))
+                    else:
+                        self.assertEqual(actual, svc.template.render(history, **kwargs))
+                self.assertEqual(kwargs, {"enable_thinking": not off})
+
+
+@unittest.skipUnless(PROTOCOL_TEST.is_file(), "build the kolibri-protocol-test target for CPU protocol checks")
+class KolibriPrefixProtocol(unittest.TestCase):
+    def setUp(self):
+        self.start("--prefix-cache")
+
+    def start(self, *args):
+        if hasattr(self, "proc"):
+            self.close(self.proc)
+        proc = subprocess.Popen([str(PROTOCOL_TEST), *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        self.proc, self.lines = proc, queue.Queue()
+        self.addCleanup(self.close, proc)
+        lines = self.lines
+
+        def read():
+            for line in proc.stdout:
+                lines.put(line.rstrip())
+            lines.put(None)
+
+        threading.Thread(target=read, daemon=True).start()
+        self.info = self.take()
+        self.assertTrue(self.info.startswith("INFO family=kolibri1 "))
+        self.assertEqual(self.take(), "READY 256 stop")
+
+    @staticmethod
+    def close(proc):
+        if proc.poll() is None:
+            proc.stdin.close()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        proc.stdout.close()
+
+    def take(self):
+        line = self.lines.get(timeout=5)
+        self.assertIsNotNone(line, "protocol fixture exited unexpectedly")
+        return line
+
+    def send(self, line):
+        self.proc.stdin.write(line + "\n")
+        self.proc.stdin.flush()
+
+    @staticmethod
+    def expected(ids, count):
+        history, result = list(ids), []
+        for _ in range(count):
+            value = 7
+            for token in history:
+                value = (value * 33 + token + 1) & 0xffffffff
+            result.append(1 + value % 29)
+            history.append(result[-1])
+        return result
+
+    def request(self, ids, count=3, options="", stop_at=None):
+        self.send(f"GEN {count} {options} " + ",".join(map(str, ids)))
+        tokens, progress, resumed, stopped = [], [], 0, False
+        while True:
+            line = self.take()
+            self.assertFalse(line.startswith("ERR"), line)
+            if line.startswith("RESUME "):
+                resumed = int(line.split()[1])
+            elif line.startswith("PP "):
+                progress.append(line)
+            elif line.startswith("T "):
+                tokens.append(int(line.split()[1]))
+            elif line.startswith("DONE "):
+                f = line.split()
+                self.assertEqual(len(f), 16)
+                self.assertEqual((int(f[1]), int(f[2]), int(f[8])), (len(tokens), len(ids), resumed))
+                read = int(f[14])
+                self.assertLessEqual(resumed + read, len(ids))
+                if f[5] != "cancel":
+                    self.assertEqual(resumed + read, len(ids))
+                return dict(tokens=tokens, reused=resumed, read=read, finish=f[5], progress=progress)
+            if stop_at and not stopped and line.startswith(stop_at):
+                self.send("STOP")
+                stopped = True
+
+    def test_extension_keeps_only_forwarded_output(self):
+        first = list(range(12))
+        a = self.request(first, 4)
+        self.assertEqual(a["tokens"], self.expected(first, 4))
+        second = first + a["tokens"] + [7, 8]
+        b = self.request(second)
+        self.assertEqual((b["reused"], b["read"]), (len(first) + 3, 3))
+        self.assertEqual(b["tokens"], self.expected(second, 3))
+        third = second + b["tokens"] + [9]
+        c = self.request(third)
+        self.assertEqual(c["reused"], len(second) + 2)
+        self.assertEqual(c["tokens"], self.expected(third, 3))
+
+    def test_fully_cached_prompt_reuses_logits_without_caching_final_token(self):
+        ids = [5, 6, 7]
+        a = self.request(ids, 1)
+        b = self.request(ids, 1)
+        self.assertEqual((b["reused"], b["read"], b["progress"]), (3, 0, []))
+        self.assertEqual(a["tokens"], b["tokens"])
+        c = self.request(ids + a["tokens"], 1)
+        self.assertEqual((c["reused"], c["read"]), (3, 1))
+
+    def test_repeating_a_prompt_after_decode_does_not_rewind(self):
+        ids = list(range(16))
+        a = self.request(ids)
+        b = self.request(ids)
+        self.assertEqual(b["reused"], 0)
+        self.assertEqual(a["tokens"], b["tokens"])
+
+    def test_edited_shorter_and_diverging_prompts_restart(self):
+        original = list(range(16))
+        for changed in (original[:-1], [2] + original[1:], original[:-1] + [20]):
+            a = self.request(original)
+            b = self.request(changed)
+            self.assertEqual(b["reused"], 0)
+            self.assertEqual(b["tokens"], self.expected(changed, 3))
+            # Sharing part of the answer cannot rewind local KV either.
+            c = self.request(original + a["tokens"][:1] + [30])
+            self.assertEqual(c["reused"], 0)
+
+    def test_checkpoint_disabled_can_reuse_but_does_not_retain(self):
+        self.request([1, 2, 3], 1)
+        a = self.request([1, 2, 3, 4], 1, "ckpt=0")
+        self.assertEqual(a["reused"], 3)
+        b = self.request([1, 2, 3, 4], 1)
+        self.assertEqual(b["reused"], 0)
+
+    def test_invalid_request_leaves_valid_cache_and_context_is_not_bypassed(self):
+        self.request([1, 2, 3], 1)
+        for line in ("GEN 1 1,2,32", "GEN 254 1,2,3"):
+            self.send(line)
+            self.assertTrue(self.take().startswith("ERR "))
+        a = self.request([1, 2, 3, 4], 1)
+        self.assertEqual(a["reused"], 3)
+        full = [1] * 255
+        self.request(full, 1)
+        b = self.request(full, 1)
+        self.assertEqual((b["reused"], b["read"]), (255, 0))
+
+    def test_cancelled_prefill_retains_only_completed_chunks(self):
+        ids = [i % 30 for i in range(240)]
+        a = self.request(ids, 2, stop_at="PP ")
+        self.assertEqual((a["finish"], a["tokens"]), ("cancel", []))
+        self.assertGreater(a["read"], 0)
+        self.assertLess(a["read"], len(ids))
+        b = self.request(ids + [7], 2)
+        self.assertEqual(b["reused"], a["read"])
+        self.assertEqual(b["tokens"], self.expected(ids + [7], 2))
+
+    def test_cancelled_extension_counts_reused_and_new_tokens_separately(self):
+        base = list(range(16))
+        self.request(base, 1)
+        ids = base + [i % 30 for i in range(224)]
+        a = self.request(ids, 2, stop_at="PP ")
+        self.assertEqual((a["finish"], a["reused"]), ("cancel", len(base)))
+        self.assertGreater(a["read"], 0)
+        self.assertLess(a["reused"] + a["read"], len(ids))
+        b = self.request(ids + [7], 2)
+        self.assertEqual(b["reused"], a["reused"] + a["read"])
+        self.assertEqual(b["tokens"], self.expected(ids + [7], 2))
+
+    def test_cancelled_decode_commits_inflight_token_only_after_forward(self):
+        ids = list(range(12))
+        a = self.request(ids, 200, stop_at="T ")
+        self.assertEqual(a["finish"], "cancel")
+        self.assertLess(len(a["tokens"]), 200)
+        following = ids + a["tokens"] + [7, 8]
+        b = self.request(following, 2)
+        self.assertIn(b["reused"], (len(ids) + len(a["tokens"]) - 1, len(ids) + len(a["tokens"])))
+        self.assertEqual(b["tokens"], self.expected(following, 2))
+
+    def test_eos_is_not_marked_as_forwarded(self):
+        ids = [1, 2, 3]
+        a = self.request(ids, 5, "logit_bias=31:100")
+        self.assertEqual((a["tokens"], a["finish"]), ([31], "stop"))
+        b = self.request(ids + [31, 4], 1)
+        self.assertEqual((b["reused"], b["read"]), (3, 2))
+
+    def test_fully_cached_logits_are_not_changed_by_cpu_penalties(self):
+        ids = list(range(1, 30))
+        a = self.request(ids, 1)
+        b = self.request(ids, 1, "penalty_last_n=256 penalty_present=100")
+        self.assertEqual(b["tokens"], [0])
+        c = self.request(ids, 1)
+        self.assertEqual(c["tokens"], a["tokens"])
+        self.assertEqual((b["reused"], c["reused"]), (29, 29))
+
+    def test_flag_off_retains_existing_request_behavior(self):
+        self.start()
+        self.assertNotIn("prefix_cache", self.info)
+        for _ in range(2):
+            a = self.request([1, 2, 3], 1)
+            self.assertEqual((a["reused"], a["read"]), (0, 3))
+            self.assertEqual(a["tokens"], self.expected([1, 2, 3], 1))
 
 
 class RecordingEngine(MockEngine):

@@ -378,6 +378,32 @@ more expert-cache slots. INT8 changes rounding and can change generated tokens.
 Measure both speed and answer quality on the intended workload before enabling
 it; a smaller cache does not guarantee faster prompt processing.
 
+`--prefix-cache` optionally keeps the last conversation's processed KV state
+between `--serve` requests. Add it to the run config's `args`. It is off by
+default. Reuse requires the new prompt to start with every token already
+processed, in exactly the same order. This includes generated tokens that were
+fed back into the model; the final emitted token is processed on the next turn.
+An edited, shorter or different prompt starts a fresh computation. Context
+limits still apply to the complete prompt and requested response.
+
+This uses the existing KV buffers, without a second GPU cache or saved branches.
+An interrupted request retains only completed forwards. A request with
+`strata_checkpoint: false` can reuse the current prefix but does not retain its
+result for later requests. The server reports reused tokens separately; prefill
+rates count only newly processed tokens. Reuse reduces follow-up latency, not
+the work of reading a completely new prompt.
+
+For this Kolibri option, the server defaults the template's `preserve_thinking`
+to true so past thinking blocks remain part of an unchanged conversation.
+An explicit client value takes precedence. Clients that omit earlier reasoning
+or rewrite message formatting may miss the cache. Reusing states computed during
+generation also changes batching compared with a full prompt recomputation;
+rounding and generated tokens can differ. Other families and unflagged Kolibri
+requests keep their existing behavior.
+
+Build `kolibri-protocol-test`, then run `python -m unittest serve.test_kolibri`
+for the CPU-only prefix, cancellation and protocol regression tests.
+
 The custom workload runner in `tools/kolibri/benchmark.py` compares German and
 English synthetic project dossiers and pinned source-code excerpts. It prepares
 four input sizes per workload, reserving 256 output tokens within 2k, 8k, 16k

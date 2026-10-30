@@ -4881,6 +4881,10 @@ class Service:
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
+        if self.family == "kolibri1" and (getattr(self.engine, "info", {}) or {}).get("prefix_cache") == 1:
+            # Kolibri otherwise removes past thinking blocks, changing the
+            # processed token prefix even when the conversation is unchanged.
+            kwargs = {"preserve_thinking": True, **kwargs}
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
