@@ -148,9 +148,33 @@ including the answer; the default remains 32,768, with one request at a time.
 The shared HTTP server keeps its usual
 eight-token reserve within that limit. CPU expert computation, other GPU
 backends, vision and speculative decoding are not implemented in this path.
-This is a source feature, not a model in the released app or `strata launch`.
+Source setup supports this experimental path on Linux with one NVIDIA GPU of
+compute capability 8.0 or newer and a CUDA toolkit. Measurements so far are
+from an RTX 5090 only. This is a source feature, not a model in the released app
+or `strata launch`.
 
-After configuring the CUDA build described above, enable the optional target:
+Run `./setup.sh --setup` and choose **Kolibri-1** in the model-family menu, or
+select it explicitly:
+
+```sh
+./setup.sh --setup --family kolibri --model Q4_K_M --context 262144 --yes --no-start
+```
+
+Setup offers 32k, 64k, 128k and 256k context capacities; the default is 32k.
+These limits include the answer. To use the pinned GGUF you already have, add
+`--gguf-dir /path/to/Kolibri-1`, naming the folder containing
+`Kolibri-1-Q4_K_M.gguf`.
+
+Setup downloads the pinned file when needed, checks its size and SHA-256, and
+exports its tokenizer and chat template. It builds the optional engine in
+`build-kolibri/` and installs it with its matching library in `engine-kolibri/`.
+It writes `strata-kolibri-q4_k_m.json` and `run-kolibri-q4_k_m.sh` in the checkout.
+The command above prepares everything without starting the server. On the next
+run, use `./setup.sh` to choose the installed model, or run
+`./run-kolibri-q4_k_m.sh` directly.
+
+For a direct development build, configure CUDA as described above and enable
+the optional target:
 
 ```sh
 cmake -S . -B build -DSTRATA_BUILD_KOLIBRI=ON

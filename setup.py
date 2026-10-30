@@ -102,6 +102,7 @@ HF_REVISIONS = {
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "1ada08422e404aca51ab9df665f089f34c419c6b",           # 2026-10-13
     "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": "f924b94f19c1fea02c06a65c8475b0a45e2b88b1",             # 2026-10-20 (the port's reference)
     "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF": "cb02422c900df489cea5833e8a92171224059b3c",    # 2026-10-24 (ISTA-DASLab's final 1.75 / 2.00 / 2.25 bpw sets and Engram)
+    "bartowski/Kolibri-1-GGUF": "ffd6001f205725f0c4af4ff93e33c04f0f8ad9f9",
 }
 
 
@@ -657,6 +658,17 @@ OWN_PATH_FAMILIES = {
 }
 PREVIEW_FAMILIES = OWN_PATH_FAMILIES             # the earlier name (tools and tests that import it)
 
+# Source-only engines have no release package and do not use Flash-Next's packs or MTP.
+KOLIBRI_FILES = {
+    "Kolibri-1-Q4_K_M.gguf": (49759219584, "2f2670a78b5c21bef65ef286791285d8e0ad79aef5f0904a3784cb7eeadd5f3e"),
+}
+SOURCE_FAMILIES = {
+    "kolibri": {"title": "Kolibri-1", "by": "Aleph Alpha; GGUF by Bartowski", "arch": "kolibri1",
+                "about": "experimental Q4_K_M, Linux and NVIDIA CUDA sm_80+; compiled here, text only",
+                "hf": hf("bartowski/Kolibri-1-GGUF"), "file": "Kolibri-1-{q}.gguf", "tag": "kolibri-",
+                "name": "kolibri-1", "models": {"Q4_K_M": {"ram_gb": 64}}, "sha256": KOLIBRI_FILES},
+}
+
 # DeepSeek-V4.1-Flash (GGUF architecture deepseek41), Unsloth's UD-Q8_K_XL at the revision the port was checked against: a
 # family with an engine of its own (strata-dsv41, src/dsv41, ported from Project Maya's maya-ds4, MIT) that is not a
 # Flash-Next pack and not a single GGUF: nine shards (508.4 GB, the routed experts as MXFP4, the dense weights in BF16, and
@@ -793,6 +805,7 @@ MULTI_FILE_FAMILIES["deepseek41"]["models"] = {
 # checks the file against it as soon as it is whole (a wrong file is deleted and setup stops), and stops before the
 # download when the server's size is not the pinned one.  The files are fetched from the commits in HF_REVISIONS.
 REPO_PINS = {
+    "bartowski/Kolibri-1-GGUF": KOLIBRI_FILES,
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": ISTA_FILES,
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": SWIFT_FILES,
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": CODER_FILES,
@@ -2031,7 +2044,7 @@ def recommend_remote_expert_opt(cfg: dict, off: bool = False) -> None:
 def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
     """Starting a model set up for one card on a PC with two or more that can share it: asked once (the answer is
     saved in its config)."""
-    if isinstance(cfg.get("gpu"), list) or cfg.get("gpus_asked"):
+    if cfg.get("arch") == "kolibri1" or isinstance(cfg.get("gpu"), list) or cfg.get("gpus_asked"):
         return cfg
     found = gpus()
     can = together_ok(found)
@@ -6591,6 +6604,13 @@ def choices_from_config(cfg_path: Path) -> dict:
     """The setup answers a config was written with (family, size, context, KV, images, projection, network)."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     tag = cfg_path.stem[len("strata-"):]
+    if cfg.get("arch") == "kolibri1":
+        a = cfg.get("args", [])
+        ctx = a[a.index("--max-context") + 1] if "--max-context" in a[:-1] else None
+        return {"family": "kolibri", "model": "Q4_K_M", "context": int(ctx) if ctx else None,
+                "kv": None, "vision": "none", "esp": "off", "host": cfg.get("host"),
+                "api_key": cfg.get("api_key"), "port": cfg.get("port"), "gpu": cfg.get("gpu"),
+                "layer_split": None, "cuda": None, "vram_reserve_mib": None}
     big = next((f for f, d in MULTI_FILE_FAMILIES.items() if tag.startswith(d["tag"])), None)
     if big is not None:                                # DeepSeek-V4.1-Flash: its own size; no KV / images / projection settings
         d = MULTI_FILE_FAMILIES[big]
@@ -6635,11 +6655,11 @@ def choices_from_config(cfg_path: Path) -> dict:
 def calibration_targets(have: list, model: str | None, family: str | None) -> list:
     """#2036: the installed configs `--calibrate --model X` (and/or --family) means; every config with neither."""
     if not (model or family):
-        return [c for c in have if choices_from_config(c)["family"] not in (*OWN_PATH_FAMILIES, *MULTI_FILE_FAMILIES)]
+        return [c for c in have if choices_from_config(c)["family"] not in (*OWN_PATH_FAMILIES, *MULTI_FILE_FAMILIES, *SOURCE_FAMILIES)]
     out = []
     for c in have:
         ch = choices_from_config(c)
-        if ch["family"] in OWN_PATH_FAMILIES or ch["family"] in MULTI_FILE_FAMILIES:   # the tuning measures Flash-Next's engine settings
+        if ch["family"] in (*OWN_PATH_FAMILIES, *MULTI_FILE_FAMILIES, *SOURCE_FAMILIES):   # tuning measures Flash-Next's engine settings
             continue
         if (not model or ch["model"] == model) and (not family or ch["family"] == family):
             out.append(c)
@@ -6894,11 +6914,21 @@ def update_install(have: list, a) -> int:
         return 0
     pip_install(runtime_packages(),
                 "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil, textual (the screens)")
-    if not a.build:
+    if not a.build and any(json.loads(p.read_text(encoding="utf-8-sig")).get("arch") != "kolibri1" for p in have):
         update_installed_engine(a.prebuilt)
     mtp_done: set = set()
     for cfg_path in have:
         cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
+        if cfg.get("arch") == "kolibri1":
+            gpu = gpu_info(cfg.get("gpu"))
+            if gpu is None:
+                fail("the GPU selected for Kolibri-1 was not found", "run ./setup.sh --setup --family kolibri --gpu N")
+            eng = build_kolibri_engine(gpu, a.yes)
+            cfg["exe"] = str(eng / "strata-kolibri")
+            cfg["lib_dirs"] = json.loads((eng / "BUILD.json").read_text()).get("cuda_dirs", [])
+            write_config(cfg_path, cfg)
+            ok(f"{cfg.get('model_name', cfg_path.stem)}: source engine updated")
+            continue
         if not own_path_config(cfg):
             refresh_shared_draft_vocab(cfg, mtp_done)
         if cfg.get("backend") == "hip" and WIN:
@@ -6956,6 +6986,11 @@ def _start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open
     """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab,
     --vram-reserve-mib)."""
     cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
+    if cfg.get("arch") == "kolibri1":
+        if len(gpu_sel(gpu if gpu is not None else cfg.get("gpu"))) > 1 or layer_split is not None:
+            fail("Kolibri-1 runs on one NVIDIA GPU only", "use --gpu N for one card")
+        if (keep or {}).get("vram_reserve_mib") is not None:
+            fail("Kolibri-1 does not accept --vram-reserve-mib", "its engine keeps a 768 MiB reserve automatically")
     component = engine_component.is_reference(cfg["exe"])
     # The server resolves and verifies component engines; the reference itself is not a file.
     files = ([] if component else [cfg["exe"]]) + [a for a in cfg["args"] if a.endswith(".gguf")]
@@ -7407,6 +7442,15 @@ def ensure_engine_for(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
     CUDA 13 engine moves the model to the experimental CUDA 12 engine (CUDA 13 has no code for it)."""
     if engine_component.is_reference(cfg.get("exe")):
         return cfg                                    # the server checks the installed component, not ROOT/engine
+    if cfg.get("arch") == "kolibri1":
+        if len(cards) != 1 or sys.platform != "linux" or WIN:
+            fail("Kolibri-1 needs Linux and one NVIDIA CUDA GPU", "run setup on a supported PC")
+        stamp = Path(cfg["exe"]).parent / "BUILD.json"
+        archs = arch_numbers(json.loads(stamp.read_text()).get("archs")) if stamp.exists() else []
+        if int(cards[0]["arch"]) < 80 or (archs and int(cards[0]["arch"]) not in archs):
+            fail("the Kolibri engine was not built for this GPU",
+                 "run ./setup.sh --setup --family kolibri --model Q4_K_M --gpu " + str(cards[0]["index"]))
+        return cfg
     tk = config_toolkit(cfg)
     if tk == 13 and any(int(g["arch"]) < CUDA13_MIN_ARCH for g in cards):
         return use_cuda12(cards, cfg_path, cfg, yes)
@@ -7757,6 +7801,120 @@ def own_path_parallel_note(a_parallel, fam: dict, model: str, vram_gb: float, ct
         lines.append(f"recommended for this card: {rec} - more slots leave fewer experts in VRAM, which can make every "
                      "request slower; kept as you chose")
     return lines
+
+
+def source_menu_families(hip: bool) -> list:
+    return list(SOURCE_FAMILIES) if sys.platform == "linux" and not WIN and not CONTROL and not hip else []
+
+
+def build_kolibri_engine(gpu: dict, yes: bool) -> Path:
+    """Build the source-only engine in its own folders; never replace the release engine."""
+    acquisition.require("a Kolibri engine build")
+    eng = home() / "engine-kolibri"
+    stamp = eng / "BUILD.json"
+    meta = json.loads(stamp.read_text()) if stamp.exists() else {}
+    src = source_hash(ENGINE_SOURCES)
+    arch = int(gpu["arch"])
+    if meta.get("src") == src and arch in arch_numbers(meta.get("archs")) and all(
+            (eng / name).is_file() for name in ("strata-kolibri", KQ_LIB)):
+        ok("Kolibri engine already built for this GPU")
+        return eng
+    llama = get_llama_cpp()
+    nvcc, vcvars = install_build_tools({**gpu, "archs": [arch], "toolkit": 13}, yes)
+    bdir = ROOT / "build-kolibri"
+    cmake_build(ROOT, bdir, "strata-kolibri",
+                ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_ENABLE_HIP=OFF", "-DSTRATA_ENABLE_SYCL=OFF",
+                 "-DSTRATA_BUILD_KOLIBRI=ON", "-DSTRATA_BUILD_TESTS=OFF",
+                 "-DSTRATA_Q6K_EXPERTS=ON", "-DSTRATA_MMQ_KQUANTS=ON",
+                 f"-DCMAKE_CUDA_ARCHITECTURES={arch}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
+                 f"-DSTRATA_GGML_DIR={llama}", *toolkit_root_defs(nvcc), *host_compiler_defs(True)],
+                vcvars, "build-kolibri.bat")
+    eng.mkdir(parents=True, exist_ok=True)
+    for name in ("strata-kolibri", KQ_LIB):
+        if not (bdir / name).is_file():
+            fail(f"the Kolibri build did not produce {name}", "check the CUDA build output above")
+        shutil.copy2(bdir / name, eng / name)
+    bindir = Path(nvcc).parent
+    dirs = [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64", bindir.parent / "lib") if d.is_dir()]
+    stamp.write_text(json.dumps({"source": "local", "version": source_version(), "archs": [arch],
+                                 "src": src, "cuda_dirs": dirs}, indent=2))
+    return eng
+
+
+def install_kolibri(a, gpu, hip, port, ram, adopted):
+    """Install the pinned GGUF, source engine, tokenizer and one-request start profile."""
+    fam = SOURCE_FAMILIES["kolibri"]
+    if not source_menu_families(hip) or int(gpu.get("arch", 0)) < 80:
+        fail("Kolibri-1 requires Linux and one NVIDIA CUDA GPU with compute capability 8.0 or newer",
+             "this experimental source engine has no AMD, Intel, Windows or Mac backend")
+    if a.model not in (None, "Q4_K_M"):
+        fail("Kolibri-1 setup currently supports Q4_K_M only", "use --model Q4_K_M")
+    if getattr(a, "gpus", None) or getattr(a, "layer_split", None) or len(gpu.get("archs", [])) > 1:
+        fail("Kolibri-1 runs on one GPU only", "use --gpu N instead of --gpus")
+    if getattr(a, "parallel", None) not in (None, 1):
+        fail("Kolibri-1 runs one request at a time", "use --parallel 1")
+    if a.vision not in (None, "no", "none"):
+        fail("Kolibri-1 setup is text-only", "use --vision no")
+    if a.context is not None and not 1 <= a.context <= 262144:
+        fail("Kolibri-1 context must be between 1 and 262144 tokens", "choose 32768, 65536, 131072 or 262144")
+    if a.rope_scaling or a.rope_scale or a.kv or a.resident_budget_gib is not None or a.vram_reserve_mib is not None:
+        fail("Kolibri-1 does not use Flash-Next's RoPE, KV or memory-budget switches",
+             "it uses FP16 KV, an automatic expert cache and a 768 MiB VRAM reserve")
+    if ram < 64:
+        confirm_risk("Kolibri-1 Q4_K_M is recommended with at least 64 GB of RAM; pinned experts need 43.62 GiB "
+                     "plus 8 GiB of available RAM at startup", bool(a.model), a.yes,
+                     "Kolibri-1 needs more available RAM", "free RAM or choose a smaller model", "  Install it anyway?")
+    say(f"  {fam['title']}: {fam['about']}")
+    if a.context is None:
+        contexts = [32768, 65536, 131072, 262144]
+        for i, ctx in enumerate(contexts, 1):
+            say(f"  {i}) {ctx // 1024}K context" + (" (default)" if i == 1 else ""))
+        ctx = contexts[int(ask("Context?", ["1", "2", "3", "4"], "1", a.yes)) - 1]
+    else:
+        ctx = a.context
+    folder = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / "Kolibri-1"
+    gguf = folder / fam["file"].format(q="Q4_K_M")
+    existing = gguf.is_file()
+    if a.gguf_dir and not existing:
+        fail(f"{gguf} is missing", "choose the folder containing Kolibri-1-Q4_K_M.gguf with --gguf-dir")
+    size, digest = fam["sha256"][gguf.name]
+    part = gguf.with_name(gguf.name + ".part")
+    left = 0 if existing else max(0, size - (part.stat().st_size if part.is_file() else 0)) / 1e9
+    if left and free_gb(folder) < left:
+        fail(f"not enough free disk space in {folder}: need ~{left:.1f} GB", "use --models-dir on a bigger drive")
+    step(3, "Python packages")
+    pip_install(runtime_packages(), "the existing Strata runtime and build packages")
+    step(4, "building the Kolibri CUDA engine")
+    llama = get_llama_cpp()
+    eng = build_kolibri_engine(gpu, a.yes)
+    step(5, "Kolibri-1 Q4_K_M (49.76 GB, resumable download)")
+    if not existing:
+        download(fam["hf"] + gguf.name, gguf, "Kolibri-1 Q4_K_M")
+    verify_sha256(gguf, size, digest, own=existing)
+    step(6, "extracting the tokenizer from the GGUF")
+    data, _ = data_folder_for(a)
+    pack = data / "packs" / "kolibri-q4_k_m"
+    run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(gguf), "--out", str(pack)],
+        env=dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py")))
+    step(7, "writing the Kolibri start profile")
+    flags = ["--split-k-attention", "--split-k-local-attention", "--grouped-experts", "--decode-cache-lru",
+             "--prefill-attention", "--fused-decode", "--tensor-decode-attention", "--grouped-prefill", "--gpu-greedy",
+             "--pin-experts", "--overlap-prefill-uploads", "--gpu-expert-cache", "--kv-grow", "--overlap-decode-cache",
+             "--two-query-prefill"]
+    cfg = {"exe": str(eng / "strata-kolibri"), "args": ["--native", str(gguf), "--max-context", str(ctx),
+            "--chunk", "4096", "--expert-vram", "-1", *flags], "arch": "kolibri1", "model_name": "kolibri-1-q4_k_m",
+           "tokenizer": str(pack / "tokenizer"), "cwd": str(ROOT), "log": str(home() / "strata-kolibri-q4_k_m.log"),
+           "parallel": 1, "gpu": gpu["index"], "gpus_asked": True, "host": a.host or "127.0.0.1", "port": port,
+           "lib_dirs": json.loads((eng / "BUILD.json").read_text()).get("cuda_dirs", [])}
+    if a.api_key:
+        cfg["api_key"] = a.api_key
+    if a.browser is not None:
+        cfg["open_browser"] = a.browser
+    cfg_path = home() / "strata-kolibri-q4_k_m.json"
+    write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None, explicit_args(a))
+    script = write_run_script("kolibri-q4_k_m", cfg_path, port, cfg.get("open_browser") is not False)
+    ok(f"Kolibri ready: {script.name}; API http://{cfg['host']}:{port}/v1")
+    return 0 if a.no_start else start(cfg_path, port)
 
 
 def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted):
@@ -8772,15 +8930,19 @@ def main() -> int:
     except Exception:
         pass
     if sys.platform == "darwin" and not CONTROL:       # a Mac: metal/setup_mac.py (the Metal engine); the app (Control mode) goes on below
+        if "--family=kolibri" in sys.argv or any(x == "--family" and y == "kolibri" for x, y in zip(sys.argv, sys.argv[1:])):
+            fail("Kolibri-1 setup requires Linux and NVIDIA CUDA", "the source engine has no Metal backend")
         return mac_setup(sys.argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--family", choices=list(FAMILIES) + list(PREVIEW_FAMILIES) + list(MULTI_FILE_FAMILIES),
+    ap.add_argument("--family", choices=list(FAMILIES) + list(PREVIEW_FAMILIES) + list(MULTI_FILE_FAMILIES) + list(SOURCE_FAMILIES),
                     help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, qwen36 = Qwen3.6-35B-A3B (pictures with --vision, "
                          "several requests at once with --parallel; docs/QWEN36.md), deepseek41 = DeepSeek-V4.1-Flash "
-                         "(the official 1.75 / 2.00 / 2.25 bpw versions, 239 / 257 / 274 GB; docs/DEEPSEEK41.md)")
+                         "(the official 1.75 / 2.00 / 2.25 bpw versions, 239 / 257 / 274 GB; docs/DEEPSEEK41.md), "
+                         "kolibri = experimental Kolibri-1 Q4_K_M (Linux/NVIDIA, compiled from source)")
     ap.add_argument("--model", choices=list(dict.fromkeys([*MODELS, *(m for f in PREVIEW_FAMILIES.values()
                                                                        for m in f["models"]),
-                                                          *(m for f in MULTI_FILE_FAMILIES.values() for m in f["models"])])))
+                                                          *(m for f in MULTI_FILE_FAMILIES.values() for m in f["models"]),
+                                                          *(m for f in SOURCE_FAMILIES.values() for m in f["models"])])))
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
                     help="the RoPE extension for a context past the model's trained 262144: linear (position "
@@ -8911,13 +9073,16 @@ def main() -> int:
                          "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
-    if a.model and a.model not in MODELS and a.family not in PREVIEW_FAMILIES and a.family not in MULTI_FILE_FAMILIES:
-        ap.error(f"--model {a.model} is a size of " + ", ".join(f"--family {f}" for f, d in {**PREVIEW_FAMILIES, **MULTI_FILE_FAMILIES}.items()
+    if a.model and a.model not in MODELS and a.family not in (*PREVIEW_FAMILIES, *MULTI_FILE_FAMILIES, *SOURCE_FAMILIES):
+        ap.error(f"--model {a.model} is a size of " + ", ".join(f"--family {f}" for f, d in {**PREVIEW_FAMILIES, **MULTI_FILE_FAMILIES, **SOURCE_FAMILIES}.items()
                                                               if a.model in d["models"]))
     if a.source:
         os.environ["STRATA_SOURCE"] = a.source
     if a.inspect:                                      # headers only: nothing is installed
         sys.exit(subprocess.run([sys.executable, str(ROOT / "tools" / "strata_inspect.py"), *a.inspect[:2]]).returncode)
+    if a.family in SOURCE_FAMILIES and (not source_menu_families(a.backend == "hip") or a.backend not in (None, "cuda")):
+        fail("Kolibri-1 setup requires a Linux source checkout and NVIDIA CUDA",
+             "the released app and AMD, Intel, Windows and Mac backends do not include this engine")
     if sys.platform == "darwin" and CONTROL:           # the app on a Mac: model files only; the Metal engine is a component
         if a.family in MULTI_FILE_FAMILIES:            # DeepSeek-V4.1-Flash: its own engine package, the generic DeepSeek install
             return mac_dsv41_setup(a)
@@ -8959,7 +9124,8 @@ def main() -> int:
         else:
             a.gpu = order[0]
     say("Strata - " + (MULTI_FILE_FAMILIES[a.family]["title"] if a.family in MULTI_FILE_FAMILIES else
-                       OWN_PATH_FAMILIES[a.family]["title"] if a.family in OWN_PATH_FAMILIES else "Qwen3.8-Flash-Next")
+                       OWN_PATH_FAMILIES[a.family]["title"] if a.family in OWN_PATH_FAMILIES else
+                       SOURCE_FAMILIES[a.family]["title"] if a.family in SOURCE_FAMILIES else "Qwen3.8-Flash-Next")
         + " on a normal PC (a GPU + system RAM + CPU)")
     have = installed_configs()
     # A plain start of an installed model finds everything where it already is: it creates, moves and copies nothing
@@ -9234,6 +9400,12 @@ def main() -> int:
         a.build = True
     if a.check:
         say()
+        if a.family == "kolibri":
+            fits = not hip and int(gpu.get("arch", 0)) >= 80 and ram >= 64
+            say("  Kolibri-1 Q4_K_M: 49.76 GB download; Linux/NVIDIA sm_80+, 64 GB RAM recommended; "
+                + ("fits" if fits else "does not meet the recommended hardware"))
+            say("  Source engine compiled here; text only, one request at a time; context up to 256K.")
+            return 0 if fits else 1
         any_fits = False
         for m, d in MODELS.items():
             have_gb = mem_have(m, ram, gpu["vram_gb"])
@@ -9296,14 +9468,19 @@ def main() -> int:
             say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
                 + family_menu_note(f, hip, gpu, avx2, avx512)
                 + (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if f == rec_fam and rec_fam != fams[0] else ""))
-        for j, f in enumerate([*OWN_PATH_FAMILIES, *MULTI_FILE_FAMILIES], len(fams) + 1):   # families with an engine path of their own
-            d = {**OWN_PATH_FAMILIES, **MULTI_FILE_FAMILIES}[f]
-            say(f"  {j}) {d['title']:20s} {d['by']} - {d['about']}   [new]")
-        allf = fams + list(OWN_PATH_FAMILIES) + list(MULTI_FILE_FAMILIES)
+        sources = source_menu_families(hip)
+        for j, f in enumerate([*OWN_PATH_FAMILIES, *MULTI_FILE_FAMILIES, *sources], len(fams) + 1):   # engines with their own path
+            d = {**OWN_PATH_FAMILIES, **MULTI_FILE_FAMILIES, **SOURCE_FAMILIES}[f]
+            say(f"  {j}) {d['title']:20s} {d['by']} - {d['about']}   " + ("[experimental source]" if f in sources else "[new]"))
+        allf = fams + list(OWN_PATH_FAMILIES) + list(MULTI_FILE_FAMILIES) + sources
         if tier_note(ram, low_ram_vram(gpu)) and rec_fam == "swift":
             say("  " + tier_note(ram, low_ram_vram(gpu)))
         family = allf[int(ask("Which model?", [str(i) for i in range(1, len(allf) + 1)],
                               str(allf.index(rec_fam) + 1), a.yes)) - 1]
+    if family in SOURCE_FAMILIES:
+        if multi:
+            fail("Kolibri-1 runs on one GPU only", "use --gpu N instead of --gpus")
+        return install_kolibri(a, gpu, hip, port, ram, adopted)
     if family in OWN_PATH_FAMILIES:                    # Qwen3.6: its own engine path, its own steps 2-7
         return install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted)
     if family in MULTI_FILE_FAMILIES:                  # DeepSeek-V4.1-Flash: nine shards, its own engine, several cards

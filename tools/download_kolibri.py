@@ -4,8 +4,8 @@
     python tools/download_kolibri.py --dry-run
     python tools/download_kolibri.py --connections 32 --output-dir /data/Kolibri-1
 
-Interrupted downloads resume on the next run. Downloading does not add Kolibri
-support to the Strata engine.
+Interrupted downloads resume on the next run. This script only downloads the
+GGUF; source setup builds and configures the optional Kolibri engine.
 """
 from __future__ import annotations
 
@@ -19,10 +19,10 @@ sys.path.insert(0, str(ROOT))
 import setup  # noqa: E402
 
 REPO = "bartowski/Kolibri-1-GGUF"
-REVISION = "ffd6001f205725f0c4af4ff93e33c04f0f8ad9f9"
-FILENAME = "Kolibri-1-Q4_K_M.gguf"
-SIZE = 49_759_219_584
-SHA256 = "2f2670a78b5c21bef65ef286791285d8e0ad79aef5f0904a3784cb7eeadd5f3e"
+FAMILY = setup.SOURCE_FAMILIES["kolibri"]
+REVISION = setup.HF_REVISIONS[REPO]
+FILENAME = FAMILY["file"].format(q="Q4_K_M")
+SIZE, SHA256 = FAMILY["sha256"][FILENAME]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,8 +44,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         return 0
 
-    # Reuse setup's resumable downloader without changing its model catalog on disk.
-    setup.REPO_PINS[REPO] = {FILENAME: (SIZE, SHA256)}
     os.environ["STRATA_DL_CONNECTIONS"] = str(args.connections)
     os.environ["STRATA_SOURCE"] = "huggingface"
     os.environ["STRATA_ALLOW_UNPINNED"] = "0"
