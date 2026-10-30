@@ -143,8 +143,9 @@ Record the actual CPU, compiler, model and validation results when reporting an 
 
 The optional source engine loads Kolibri-1 Q4_K_M directly from GGUF. It computes
 on one GPU and transfers experts from RAM when they are not in the GPU cache.
-It does not requantize the model. The current limit is 32,768 tokens including
-the answer, with one request at a time. The shared HTTP server keeps its usual
+It does not requantize the model. `--max-context` accepts up to 262,144 tokens
+including the answer; the default remains 32,768, with one request at a time.
+The shared HTTP server keeps its usual
 eight-token reserve within that limit. CPU expert computation, other GPU
 backends, vision and speculative decoding are not implemented in this path.
 This is a source feature, not a model in the released app or `strata launch`.
@@ -201,15 +202,167 @@ disable reasoning. An explicit reasoning effort takes precedence over
 
 GPU cache space is determined after the fixed weights and workspaces are
 allocated. `--expert-vram N` limits it to N GiB; `--expert-slots 0` disables it
-for comparison. Each request reads its complete history again. Long-context
+for comparison. By default the full configured context is allocated at startup.
+Increasing it leaves less GPU memory for experts, even with a short prompt. Each request
+reads its complete history again. Long-context
 latency and cache effectiveness depend on the workload; a successful build
 alone is not a model accuracy or performance measurement.
+
+`--kv-grow` optionally uses Strata's existing CUDA virtual-memory support for
+global keys and values. It initially maps up to 32,768 tokens, then grows in
+32k steps as needed, up to the configured context. Local attention is unchanged.
+This lets shorter requests keep more experts in GPU memory. When growth needs
+space, the engine empties and rebuilds a smaller expert cache, preserving the
+existing keys and values and the 768 MiB memory reserve. Growing and rewarming
+the expert cache take time. The mapped capacity and smaller cache persist across
+requests until the engine exits. Allocation failures are reported explicitly;
+the engine never silently reduces the configured context. The flag is off by
+default and requires CUDA virtual-memory support.
 
 For a numerical comparison, `tools/kolibri/parity.py --help` documents a
 separate llama.cpp reference build pinned to
 `9df0b73c707900b7277a46b5ae52ff7e7e567d13`. It compares layers, logits and
 optional routing traces on identical token IDs. Keep this reference separate
 from Strata's existing llama.cpp dependency.
+
+`--split-k-attention` is an optional optimization for global attention while
+generating an answer. It divides the visible keys among GPU blocks and combines
+their results in FP32. It applies from 1,024 keys onward. Local attention and
+prompt processing use the existing path. Add the flag to the run config's
+`args` to enable it; it is off by default.
+The changed reduction order can cross activation-quantization rounding
+boundaries and change generated tokens, including with greedy sampling.
+The optimized path is not bitwise identical to the original path.
+
+`--split-k-local-attention` separately enables FP32 split attention during
+generation once the local window contains all 513 keys. Shorter local windows
+and prompt processing keep their existing path. It is off by default and can
+change generated tokens through its different reduction order.
+
+`--grouped-experts` is a separate optional decode optimization. It processes
+the six selected experts together and reuses their quantized input. It supports
+Q4_K, Q6_K and Q8_0 expert weights, including mixed gate/up formats. Prompt
+processing uses the existing path. The grouped path needs additional GPU
+buffers; these are allocated before the automatic expert-cache budget is set.
+
+`--grouped-prefill` separately batches prompt experts, including mixed
+Q4_K, Q6_K and Q8_0 gate/up formats. Each group contains at most 16 experts and
+one chunk's routed rows, including experts selected by only one token.
+Cache admission and expert accumulation order are unchanged. Small batches use
+MMQ instead of MMVQ; this changes rounding and can change generated tokens.
+The flag is off by default and adds
+about 128 MiB of workspace for this Q4_K_M model, or about 104 MiB when grouped
+decode already provides part of the staging space. These buffers are allocated
+before the automatic expert-cache budget is set.
+
+`--fused-decode` combines projection launches and residual-normalization steps
+during single-token generation. It is designed to preserve the existing FP32
+rounding and produce bitwise-equal outputs with the same attention settings.
+It works independently of `--grouped-experts`; enabling both also reuses the
+shared expert's quantized input for the six selected experts. Prompt processing
+keeps its existing path. The flag is off by default.
+The fused path also uses a single warp to select the same six experts. With
+grouped experts enabled, it downloads their IDs while the shared expert runs.
+It swaps local KV buffers after copying their retained history, avoiding a
+second copy. This needs 8 MiB of extra GPU scratch space at chunk size 4,096.
+
+The `--fused-decode` and `--prefill-attention` paths compute each position's
+RoPE sine/cosine table once per forward pass and reuse it across local layers.
+This preserves the existing angle calculation and FP32 rounding. The table
+adds at most 2 MiB of GPU memory with a 4,096-token chunk.
+
+`--gpu-greedy` chooses the next token on the GPU for serving requests with
+temperature zero, no effective repetition/frequency/presence penalties, no
+logit bias and no requested log probabilities. It preserves the lowest-token-ID
+tie rule and rejects non-finite logits. Other requests use the existing CPU
+sampler, including seeded sampling; diagnostic full-logit output is unchanged.
+The flag is off by default and is independent of the attention and expert flags.
+
+`--decode-cache-lru` requires `--grouped-experts`. During generation it replaces
+the least recently used resident expert when a cache miss needs a slot. All six
+experts selected for the current layer are protected from replacement. Prompt
+processing retains its existing cache-admission behavior.
+
+`--pin-experts` optionally keeps all expert weights in CUDA-registered RAM on
+Linux. The Q4_K_M model used here needs about 43.62 GiB for these weights.
+Startup requires that amount plus 8 GiB of available RAM. It copies the weights
+in small batches and releases their original file-cache pages without changing
+the GGUF. Registration uses normal pages for these allocations; system memory
+settings are unchanged. This adds preparation time and keeps that RAM occupied
+until the engine exits. Experimental startup checks stop preparation if available
+RAM falls below 8 GiB, system swap use grows by more than 256 MiB, or the engine
+has more than 64 MiB in swap. These checks do not run during generation.
+
+`--overlap-prefill-uploads` requires `--pin-experts --grouped-prefill`. It overlaps
+expert transfers with prompt computation on a separate CUDA stream. The existing
+expert order and arithmetic stay the same. `--gpu-expert-cache` requires
+`--pin-experts --grouped-experts --decode-cache-lru --fused-decode`. During
+generation the GPU selects cache slots and copies missing experts from registered
+RAM. The CPU reconciles the cache after each token. Layer and routing diagnostic
+dumps retain the CPU-managed path. All three flags are off by default.
+
+`--overlap-decode-cache` requires `--gpu-expert-cache --overlap-prefill-uploads`.
+During generation it prepares the selected expert weights while the shared
+expert computes, using the existing upload stream. The expert calculations and
+cache updates stay the same. Prompt processing is unchanged. It is off by default.
+
+The optional `--prefill-attention` kernel uses tensor cores and requires CUDA
+compute capability 8.0 or newer. It keeps FP16 keys/values and represents queries
+and probabilities with a pair of half-precision values. Its rounding differs
+from the original FP32 attention path. `--chunk` accepts up to 4,096 prompt
+tokens; the default remains 256. Larger chunks also change expert batching and
+can change generated tokens.
+
+`--two-query-prefill` requires `--prefill-attention` and is off by default. It
+shares each global-attention key/value tile between two prompt tokens while
+keeping each token's arithmetic and causal masking. Local attention, generation
+and prompt chunks containing only one token keep their existing paths.
+
+`--tensor-decode-attention` enables tensor-core attention during generation,
+independently of `--prefill-attention`. It requires compute capability 8.0 or
+newer and applies to global attention and full 513-key local windows. Where it
+applies, it takes precedence over both split-attention flags. Shorter local
+windows keep their existing path. Like the tensor-core prompt path, it uses
+paired half-precision queries and probabilities, changes rounding, and can
+change generated tokens. It is off by default.
+
+The custom workload runner in `tools/kolibri/benchmark.py` compares German and
+English synthetic project dossiers and pinned source-code excerpts. It prepares
+four input sizes per workload, reserving 256 output tokens within 2k, 8k, 16k
+and 32k budgets. These are developer measurements, not the standard Qwen
+benchmark protocol. Use `prepare --help` to freeze the prompts, then run both
+executables against the same fixture directory:
+
+```sh
+python tools/kolibri/benchmark.py run --model MODEL.gguf \
+  --engine /path/to/baseline/strata-kolibri --fixtures FIXTURES --out BASELINE_RESULTS
+python tools/kolibri/benchmark.py run --model MODEL.gguf \
+  --engine /path/to/candidate/strata-kolibri --engine-arg=--split-k-attention \
+  --fixtures FIXTURES --out CANDIDATE_RESULTS
+```
+
+Keep the matching `libstrata_kq.so` beside each executable. Run one engine at a
+time. The runner defaults to 32,768 tokens of context; `--context` records a
+different capacity separately from the prompt length. The expert cache defaults to
+24 GiB; `--expert-vram` records a different budget as a separate experiment.
+Prompt chunks default to 256; use `--chunk 512`, `1024`, `2048` or `4096` for
+separate experiments. Additional VRAM is needed for the rest of the
+model and its working buffers. Each case starts a fresh engine and makes three
+requests. The first has
+an empty expert cache; the next two retain it. The OS file cache is not cleared,
+and every request processes the full prompt. Reports retain early EOS, actual
+token counts, separate prompt and generation times, and sampled RAM/VRAM.
+
+`--profile` writes diagnostic stage timings to stderr. These include CUDA
+stream intervals and CPU submission time, which overlap and must not be added
+together. Profiling adds overhead; leave it off for throughput comparisons.
+
+`tools/kolibri/llama_benchmark.py` runs the same frozen token IDs through an
+unmodified llama.cpp server at the reference revision above. It disables prompt
+reuse and records native timings, generated text and memory samples. Use
+`--help` for placement and batch settings. The script records both llama.cpp's
+native decode rate and the rate using Strata's token-count convention; the
+first output token accounts for the difference.
 
 ## Updating
 
