@@ -45,7 +45,7 @@ class KolibriParser(unittest.TestCase):
             self.assertEqual([x.call.arguments for x in ev if x.kind == "tool_call"], [{"city": "Köln"}] * 2)
 
     def test_json_strings_can_contain_envelope_markers(self):
-        args = {"city": 'quote " \\ </tool_call> { } <think> </think> test'}
+        args = {"city": 'quote " \\ </tool_call> { } <think> </think> </function><tool_call><function=weather> test'}
         text = "<tool_call>" + json.dumps({"name": "weather", "arguments": args}) + "</tool_call>"
         for step in (1, 11, len(text)):
             calls = [x.call for x in parse(text, step=step) if x.kind == "tool_call"]
